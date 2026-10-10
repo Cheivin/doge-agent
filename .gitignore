@@ -1,0 +1,28 @@
+# binary
+/doge
+/doge-*
+/dio
+
+# reference sources (research material, not part of doge)
+research/
+
+# test scratch
+*.log
+
+# build output
+/dist
+
+# session/harness artifacts
+/.zcode
+
+# local two-node mesh test env (credentials/tokens — never commit)
+/test/
+
+# local-only e2e harness for the desktop frontend (dev scaffold, not shipped)
+/desktop/e2e/
+
+# internal notes & third-party extracted assets (not part of the open-source tree)
+/docs/internal/
+
+# IDE
+/.idea/

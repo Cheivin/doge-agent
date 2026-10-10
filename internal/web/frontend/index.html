@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>doge console</title>
+<link rel="stylesheet" href="/style.css">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+</head>
+<body>
+
+<!-- Login view -->
+<div id="login" class="login hidden">
+  <form id="login-form" class="login-box">
+    <h1>doge</h1>
+    <p class="muted">请输入访问 token 以连接 Web 控制台。</p>
+    <input id="token-input" type="password" placeholder="access token"
+           autocomplete="off" spellcheck="false" required>
+    <button type="submit" id="login-btn">登录</button>
+    <p id="login-error" class="error hidden"></p>
+  </form>
+</div>
+
+<!-- Chat view: sidebar (session list) + main (status / messages / composer) -->
+<div id="app" class="app hidden">
+  <aside id="sidebar">
+    <div class="sb-inner">
+      <div class="sb-brand">
+        <span class="sb-name">doge</span>
+        <span class="sb-sub">console</span>
+      </div>
+      <div class="sb-head">
+        <span class="sb-title">会话记录</span>
+        <button id="sb-collapse" title="收起会话列表">«</button>
+      </div>
+      <button id="sb-new">＋ 新建会话</button>
+      <div id="sess-list" aria-label="会话列表"></div>
+      <div class="sb-foot">
+        <div class="sb-status">
+          <span class="status-dot" id="conn-dot" title="连接状态"></span>
+          <span id="sb-status-text" class="muted">连接中…</span>
+          <button id="takeover-btn" class="hidden" title="强制夺取会话控制权：立即释放当前持有窗口，由本窗口接管">夺取</button>
+        </div>
+        <button id="settings-btn" title="模型 / MCP / 技能 设置">⚙ 设置</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 移动端侧栏覆盖层遮罩：点击任意处收起侧栏（桌面端隐藏） -->
+  <div id="sb-backdrop"></div>
+
+  <div id="main">
+    <button id="sidebar-toggle" title="展开会话列表">☰</button>
+    <main id="messages" aria-live="polite"></main>
+    <footer id="composer">
+      <div class="composer-box">
+        <div id="attach-tray" class="hidden"></div>
+        <textarea id="input" rows="1" placeholder="输入消息…" disabled></textarea>
+      </div>
+      <div class="composer-foot">
+        <button id="attach-btn" title="添加附件（也可拖拽或粘贴文件到输入框）" disabled>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"/>
+          </svg>
+        </button>
+        <span class="spacer"></span>
+        <button id="ctx-btn" class="ghost-btn" title="上下文容量与统计">◔ 上下文</button>
+        <button id="thinking-btn" class="ghost-btn" title="思考级别">⊕ 最高 ▾</button>
+        <button id="model-btn" class="ghost-btn" title="切换模型">◇ 模型 ▾</button>
+        <button id="abort-btn" class="hidden" title="中断当前运行">■ 中断</button>
+        <button id="send-btn" disabled title="发送（Enter）">↑</button>
+      </div>
+      <input id="file-input" type="file" multiple hidden>
+      <input id="skill-zip-input" type="file" accept=".zip,application/zip" hidden>
+    </footer>
+  </div>
+</div>
+
+<!-- Settings overlay：模型 / MCP / 技能 三 tab 设置中心 -->
+<div id="settings" class="settings hidden">
+  <aside class="settings-nav">
+    <div class="sb-brand">
+      <span class="sb-name">doge</span>
+      <span class="sb-sub">settings</span>
+    </div>
+    <nav class="settings-tabs">
+      <button class="settings-tab current" data-tab="models">◇ 模型</button>
+      <button class="settings-tab" data-tab="mcp">Ⓜ MCP 服务器</button>
+      <button class="settings-tab" data-tab="skills">✦ 技能</button>
+      <button class="settings-tab" data-tab="mesh">◈ Mesh 网络</button>
+    </nav>
+    <div class="settings-nav-foot">
+      <button id="nav-reload">↻ 重载配置</button>
+      <button id="nav-logout">⏻ 登出</button>
+    </div>
+  </aside>
+  <div class="settings-main">
+    <header class="settings-head">
+      <h3 id="settings-title">模型</h3>
+      <span class="spacer"></span>
+      <button id="settings-close" title="关闭">✕</button>
+    </header>
+    <div id="settings-body"></div>
+  </div>
+</div>
+
+<!-- 添加/编辑模型弹窗 -->
+<div id="model-form" class="modal hidden">
+  <div class="modal-box model-form-box">
+    <div class="stats-head">
+      <h3 id="model-form-title">添加模型</h3>
+      <button id="model-form-close" class="ghost" title="关闭">✕</button>
+    </div>
+    <div class="form-grid">
+      <label>供应商 provider<input id="mf-provider" placeholder="如 my-provider" spellcheck="false"></label>
+      <label>模型 ID<input id="mf-id" placeholder="如 deepseek-v4" spellcheck="false"></label>
+      <label>Base URL<input id="mf-baseurl" placeholder="https://api.example.com/v1" spellcheck="false"></label>
+      <label>API 格式
+        <select id="mf-api">
+          <option value="openai-completions">Chat Completions (/chat/completions)</option>
+          <option value="openai-responses">OpenAI Responses (/responses)</option>
+          <option value="anthropic-messages">Anthropic Messages (/messages)</option>
+        </select>
+      </label>
+      <label>上下文窗口（tokens）<input id="mf-ctx" type="number" min="1024" placeholder="128000"></label>
+      <label>最大输出（tokens）<input id="mf-max" type="number" min="256" placeholder="8192"></label>
+    </div>
+    <div class="form-row">
+      <span class="form-label">输入类型</span>
+      <label class="form-check"><input type="checkbox" id="mf-in-text" checked> 文本</label>
+      <label class="form-check"><input type="checkbox" id="mf-in-image"> 图片（视觉）</label>
+      <label class="form-check"><input type="checkbox" id="mf-reasoning"> 推理模型</label>
+    </div>
+    <div class="modal-actions">
+      <button id="mf-cancel">取消</button>
+      <button id="mf-save" class="primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建会话窗口：选择项目目录后开始对话（对齐桌面端） -->
+<div id="newtask" class="newtask hidden">
+  <div class="newtask-inner">
+    <div class="newtask-greet" id="newtask-greet">晚上好呀</div>
+    <div class="newtask-card">
+      <div class="newtask-selectors">
+        <button id="nt-project" class="ghost-btn" title="选择项目目录">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>
+          </svg>
+          <span id="nt-project-name">当前目录</span>
+          <span class="caret">⌄</span>
+        </button>
+      </div>
+      <textarea id="nt-input" rows="3" placeholder="向 doge 提问…（Enter 发送）"></textarea>
+      <div class="composer-foot">
+        <span class="nt-note muted">将在所选目录打开新会话</span>
+        <span class="spacer"></span>
+        <button id="nt-model" class="ghost-btn">◇ 模型 ˅</button>
+        <button id="nt-thinking" class="ghost-btn">⊕ 最高 ˅</button>
+        <button id="nt-send" class="send-btn" title="发送（Enter）">↑</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Permission modal -->
+<div id="perm" class="modal hidden">
+  <div class="modal-box">
+    <h3>权限确认</h3>
+    <div id="perm-detail"></div>
+    <div class="modal-actions">
+      <button id="perm-allow-once" class="primary">允许一次</button>
+      <button id="perm-allow-always">始终允许</button>
+      <button id="perm-deny" class="danger">拒绝</button>
+    </div>
+  </div>
+</div>
+
+<!-- Remote-task question modal -->
+<div id="question" class="modal hidden">
+  <div class="modal-box">
+    <h3>远端任务提问</h3>
+    <div id="question-detail"></div>
+    <textarea id="question-input" rows="3" placeholder="输入你的回答…"></textarea>
+    <div class="modal-actions">
+      <button id="question-submit" class="primary">回答</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
