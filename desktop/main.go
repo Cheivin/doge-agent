@@ -31,7 +31,7 @@ var assetsFS embed.FS
 
 // version 和 gitCommit 由 Makefile 在构建时通过 -ldflags 注入
 var (
-	version   = "0.11.0"
+	version   = "0.12.0"
 	gitCommit = ""
 )
 

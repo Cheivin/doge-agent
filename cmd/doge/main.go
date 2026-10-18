@@ -16,7 +16,7 @@ import (
 
 // version 和 gitCommit 由 Makefile 在构建时通过 -ldflags 注入
 var (
-	version   = "0.9.0"
+	version   = "0.12.0"
 	gitCommit = "" // 短 git 哈希（dirty 构建会带 -dirty 后缀）
 )
 

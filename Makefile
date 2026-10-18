@@ -4,7 +4,7 @@
 #
 # Mesh: the P2P layer is compiled in only with `-tags mesh` (default builds
 # stay libp2p-free). Use the build-mesh* targets for mesh-enabled binaries.
-VERSION   ?= 0.11.0
+VERSION   ?= 0.12.0
 GIT_HASH  := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 GIT_DIRTY := $(shell git status --porcelain 2>/dev/null | grep -q . && echo -dirty || echo "")
 LDFLAGS   := -s -w -X 'main.version=$(VERSION)' -X 'main.gitCommit=$(GIT_HASH)$(GIT_DIRTY)'
