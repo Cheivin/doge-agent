@@ -55,6 +55,9 @@ const (
 	// SessionKindRemote marks a session forked on the slave to execute a remote
 	// mesh task (as opposed to a user's own interactive session).
 	SessionKindRemote = "remote"
+	// SessionKindAutomation marks a session forked to execute a scheduled
+	// automation run (unattended; grouped with remote forks in the UIs).
+	SessionKindAutomation = "automation"
 )
 
 // SessionEntry is one line of a session file. Entries form a tree via

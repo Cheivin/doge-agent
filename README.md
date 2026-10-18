@@ -583,6 +583,26 @@ doge mesh forward remove  remote-echo
 - 转发协议按规则名区分（`/doge/forward/<name>/0.1`），`listen` 的 `peer` 直接来自配置（不做 name→peer 路由）。
 - 目前实现到发现/互验/消息/转发/远端任务（`remote_agent`）/远端工具直接调用（`remote_tool`）/跨节点文件传输（`mesh_file`）；会话共享、配置下发已评估关闭（见设计文档 `docs/mesh-design.md` §10，文件传输设计见 `docs/file-transfer-design.md`）。
 
+## 定时任务（scheduled automations）
+
+doge 可以创建持久化的定时任务：到点后自动拉起一个无人值守的 agent 会话执行任务 prompt，结果留存可查、可回注当前会话。在任意会话里直接说"每 20 分钟提醒我喝水"、"每周一 09:00 生成本周周报草稿"，模型会通过 `automation` 工具创建。
+
+四个管理入口：
+
+| 入口 | 用法 |
+|---|---|
+| 对话内自然语言 | 让模型调 `automation` 工具（create/list/update/delete/enable/disable/run/history） |
+| Web / 桌面设置中心 | 「定时任务」tab：任务卡片（状态/调度/下次触发/最近结果）+ 新建表单 + 启停/立即运行/历史（REST `/api/automations*`） |
+| CLI | `doge automation list / add / get / rm / enable / disable / run / history`，如 `doge automation add --title 喝水提醒 --prompt "提醒喝水" --every 20m` |
+| TUI | `/automations [list|enable|disable|run|rm|history] [id]` |
+
+调度规则三选一：一次性延时（`--delay-minutes 120`）、固定间隔（`--every 20m|2h|3d|1w|2mo`，从创建时刻锚点推导、不对齐墙钟）、cron（`--cron "0 9 * * 1"`，5 字段本地时区，只用于用户点名的墙钟时刻）。
+
+- 数据：`~/.doge/agent/automations.json`（定义+调度状态，0600，可手工编辑，常驻进程 20s 内热生效）+ `automations/runs.jsonl`（运行台账）；执行会话在侧栏归组「定时任务会话」，结果卡片自动回注来源会话
+- 安全：执行会话无人值守——工具按 `level`（readonly/write/full）分级裁剪，ask 全走 autoDecide 风险分级；任务内禁止再创建定时任务（防自我复制）
+- 边界（诚实声明）：**所有 doge 进程退出后任务不触发**，恢复运行时错过 >5 分钟的周期记 skipped 不补跑（一次性任务错过即完成）。需要 7×24 触发用 `doge --web --no-tui` 常驻，或桌面客户端托盘驻留；多进程并存靠文件认领单飞
+- 配置：settings.json `automation` 节（`enabled`/`maxConcurrentRuns`/`runTimeoutMinutes`/`historyRetentionDays`/`maxAutomations`，零值取默认 1/60min/30 天/50 条）
+
 ## 权限控制
 
 doge 内置工具调用权限层：每次工具调用（含 bash 命令）执行前按策略决策 `allow`（放行）/ `deny`（阻止并报错）/ `ask`（交互确认），配置文件在 `~/.doge/agent/permissions.json`（可选，项目级 `.doge/permissions.json` 叠加，项目配置只能收紧不能放宽全局 `deny`）。

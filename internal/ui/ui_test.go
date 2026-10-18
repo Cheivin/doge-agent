@@ -325,7 +325,7 @@ func TestCommandMenuRender(t *testing.T) {
 
 func TestHandleEvents(t *testing.T) {
 	sess := &agentSessionStub{}
-	m := newModel(sess, nil, nil, "")
+	m := newModel(sess, nil, nil, nil, "")
 	m.program = &tea.Program{}
 
 	// Message lifecycle events.

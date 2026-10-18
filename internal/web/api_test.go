@@ -90,6 +90,8 @@ type fakeBackend struct {
 	sessions    []SessionSummary
 	askH        permissions.AskHandler
 	subscribed  []agent.AgentListener
+	usable      bool
+	statusModel string
 
 	// remoteSession / mcpDesired / mcpApplied drive the per-session MCP
 	// endpoint tests (the fake mirrors the real pending → reload-on-apply
@@ -158,10 +160,14 @@ func (f *fakeBackend) ReloadConfig() error {
 	return nil
 }
 func (f *fakeBackend) Status() Status {
+	model := f.statusModel
+	if model == "" {
+		model = "model/deepseek-v4-flash"
+	}
 	return Status{
 		SessionID:    "sess-1",
 		Cwd:          "/tmp",
-		Model:        "model/deepseek-v4-flash",
+		Model:        model,
 		Thinking:     "max",
 		Streaming:    f.streaming,
 		PendingTools: []string{},
@@ -177,6 +183,7 @@ func (f *fakeBackend) ListAllModels() []ModelInfo {
 		{Spec: "model/b", Name: "B", Provider: "model", ID: "b"},
 	}
 }
+func (f *fakeBackend) HasUsableModel() bool { return f.usable }
 func (f *fakeBackend) SessionInfo() SessionInfo {
 	return SessionInfo{
 		ID:       "sess-1",

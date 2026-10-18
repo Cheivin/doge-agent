@@ -65,6 +65,7 @@ func runWebMode(a *app.App, opts cliOptions, cfg *coding.WebSettings) {
 		Address:     address,
 		Mesh:        a.MeshView,
 		Mcp:         a.Mcp,
+		Automations: a.Automation,
 		CorsOrigins: corsOrigins,
 		Uploads:     a.Uploads,
 		// POST /api/shutdown: the same graceful path as Ctrl+C (headless mode

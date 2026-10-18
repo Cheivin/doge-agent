@@ -23,24 +23,25 @@ type (
 
 	// Services 全部服务的集合，注册进 wails 的 Services
 	Services struct {
-		Session *SessionService
-		Config  *ConfigService
-		Mcp     *McpService
-		Skills  *SkillsService
-		Mesh    *MeshService
-		Uploads *UploadsService
+		Session     *SessionService
+		Config      *ConfigService
+		Mcp         *McpService
+		Skills      *SkillsService
+		Mesh        *MeshService
+		Uploads     *UploadsService
+		Automations *AutomationsService
 	}
 
 	// Deps 各服务的公共依赖
 	Deps struct {
-		Backend  web.Backend        // 会话后端（单窗口：恒可写，切换委托 AgentSession）
-		Session  *coding.AgentSession // 活动会话实例（MCP 工具重发等直操作）
-		Mcp      web.McpView        // nil = MCP 未初始化
-		Mesh     web.MeshView       // 初始 mesh 视图（运行时以 App.MeshView 为准）
-		Uploads  *uploads.Store     // nil = 上传不可用
-		Console  *Console           // 事件桥（session_reset 等帧由此发出）
-		App      *app.App           // 装配产物（mesh 运行时启停入口）
-		Version  string             // 构建版本（mesh profile 上报）
+		Backend web.Backend          // 会话后端（单窗口：恒可写，切换委托 AgentSession）
+		Session *coding.AgentSession // 活动会话实例（MCP 工具重发等直操作）
+		Mcp     web.McpView          // nil = MCP 未初始化
+		Mesh    web.MeshView         // 初始 mesh 视图（运行时以 App.MeshView 为准）
+		Uploads *uploads.Store       // nil = 上传不可用
+		Console *Console             // 事件桥（session_reset 等帧由此发出）
+		App     *app.App             // 装配产物（mesh 运行时启停入口）
+		Version string               // 构建版本（mesh profile 上报）
 	}
 )
 
@@ -58,10 +59,10 @@ func MarshalError(err error) []byte {
 }
 
 // 各类别错误构造
-func errInvalid(msg string) *ApiError   { return &ApiError{Kind: "invalid", Message: msg} }
-func errNotFound(msg string) *ApiError  { return &ApiError{Kind: "notfound", Message: msg} }
-func errBusy(msg string) *ApiError      { return &ApiError{Kind: "busy", Message: msg} }
-func errReadOnly(msg string) *ApiError  { return &ApiError{Kind: "readonly", Message: msg} }
+func errInvalid(msg string) *ApiError  { return &ApiError{Kind: "invalid", Message: msg} }
+func errNotFound(msg string) *ApiError { return &ApiError{Kind: "notfound", Message: msg} }
+func errBusy(msg string) *ApiError     { return &ApiError{Kind: "busy", Message: msg} }
+func errReadOnly(msg string) *ApiError { return &ApiError{Kind: "readonly", Message: msg} }
 func errUnavailable(msg string) *ApiError {
 	return &ApiError{Kind: "unavailable", Message: msg}
 }
@@ -72,11 +73,12 @@ func errInternal(err error) *ApiError {
 // New 装配全部服务
 func New(d Deps) *Services {
 	return &Services{
-		Session: &SessionService{d: d},
-		Config:  &ConfigService{d: d},
-		Mcp:     &McpService{d: d},
-		Skills:  &SkillsService{d: d},
-		Mesh:    &MeshService{d: d},
-		Uploads: &UploadsService{d: d},
+		Session:     &SessionService{d: d},
+		Config:      &ConfigService{d: d},
+		Mcp:         &McpService{d: d},
+		Skills:      &SkillsService{d: d},
+		Mesh:        &MeshService{d: d},
+		Uploads:     &UploadsService{d: d},
+		Automations: &AutomationsService{d: d},
 	}
 }

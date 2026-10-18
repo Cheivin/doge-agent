@@ -56,7 +56,7 @@ doge --export <session-id>
 ```bash
 doge --model deepseek/deepseek-chat                      # provider/model
 doge --model anthropic/claude-sonnet-4-5:high            # 追加思维级别
-doge --list-models                                       # 列出内置 + 自定义模型目录
+doge --list-models                                       # 列出当前可用的模型（未配密钥的目录条目隐藏并计数提示）
 doge --api-key sk-...                                    # 覆盖 auth.json / 环境变量
 ```
 
@@ -207,7 +207,7 @@ MCP 共享配置。
 ## 4. 配置文件详解
 
 ### 4.1 auth.json —— API 密钥
-<!-- module: auth-json | API 密钥存储格式、/login /logout 与环境变量兜底 -->
+<!-- module: auth-json | API 密钥存储格式、首跑向导/设置密钥面板、环境变量兜底 -->
 
 ```json
 {
@@ -221,6 +221,9 @@ MCP 共享配置。
   `openai` / `anthropic` / `deepseek` / `qwen` / `moonshot` / `zhipu` / `zai` /
   `openrouter` / `local`；自定义模型用自己的 provider 名。
 - `local` 端点（如 Ollama）无需密钥。
+- 无需手工编辑：Web/桌面端首跑向导自动引导配置；设置 → 密钥面板可随时
+  增删改（保存即热生效，显示只保留末 4 位）。密钥缺失时的报错也会指路
+  设置 → 密钥 / 环境变量 / auth.json。
 
 ### 4.2 models.json —— 自定义模型目录
 <!-- module: models-json | 自定义模型定义：provider、模型、上下文窗口、thinking、单价 -->
@@ -326,13 +329,20 @@ JSON 数组，每个元素一个模型：
     "retentionDays": 7,
     "maxImageInlineBytes": 5242880,
     "maxTextInlineBytes": 65536
+  },
+  "automation": {
+    "enabled": true,
+    "maxConcurrentRuns": 1,
+    "runTimeoutMinutes": 60,
+    "historyRetentionDays": 30,
+    "maxAutomations": 50
   }
 }
 ```
 
 | 字段 | 说明 |
 |---|---|
-| `defaultProvider` + `defaultModel` | 默认模型（未传 `--model` 时生效，两者须同时设置） |
+| `defaultProvider` + `defaultModel` | 默认模型（未传 `--model` 时生效，两者须同时设置）。指向的模型被删除/改名后启动自动回退：models.json 第一个自定义模型 → 内置默认，不拒绝启动 |
 | `defaultThinkingLevel` | 默认思维级别 |
 | `streamIdleSeconds` | 提供商静默预算（默认 120）。SSE 连接超过该时长无数据（或请求迟迟等不到响应头）即判定停摆，中断本次流并释放会话 |
 | `compaction.enabled` / `reserveTokens` / `keepRecentTokens` | 上下文压缩开关与阈值（结构体字段名大小写不敏感，小驼峰写法同样生效） |
@@ -343,6 +353,7 @@ JSON 数组，每个元素一个模型：
 | `web.noTui` | 仅 Web 模式（`--no-tui` 覆盖） |
 | `web.corsOrigins` | 允许跨域的 WebUI 来源（`--web-cors` 覆盖，可重复） |
 | `uploads.*` | 文件上传限制（零值取默认）：单请求/单文件 100MiB、暂存区配额 512MiB、保留 7 天（`~/.doge/agent/uploads`，后台周期清理）、图片直接注入对话上限 5MiB、文本全文注入上限 64KiB |
+| `automation.*` | 定时任务调度（零值取默认，仅全局生效）：并发 1、单次超时 60 分钟、台账保留 30 天、上限 50 条；`enabled=false` 可整体停用（见「4.9 定时任务」） |
 
 Web 参数优先级：**CLI 参数 > settings `web` 节 > 内置默认**。
 
@@ -560,6 +571,50 @@ mesh.json 复制到别的机器**。`trustedPeers`（同时约束远端任务、
   settings `web.token` 可固定。凭证三通道：`Authorization: Bearer <token>`
   （客户端/独立部署 WebUI 推荐）、`?token=`（浏览器 WS 自动登录）、登录换发的
   HttpOnly + SameSite=Strict 会话 cookie（7 天）。
+
+### 4.9 定时任务（automations）
+<!-- module: automations | 定时任务：automation 工具建管任务、管理面板/CLI/TUI 入口、automations.json 格式、调度边界与 settings 配置 -->
+
+会话内用自然语言让模型建定时任务（"每 20 分钟提醒我喝水"），或直接用
+`automation` 工具管理：
+
+| action | 参数 | 说明 |
+|---|---|---|
+| `create` | `title`/`prompt` + `delayMinutes` 或 `cron` 或 `intervalUnit`+`interval`（三选一） | 建任务；`cwd`/`model`/`level`/`maxRuns` 可选 |
+| `list` / `get` | `id`（get） | 概要表 / 详情 + 最近 3 次 |
+| `update` | `id` + 可变字段 | 调度变更即重锚重算下次触发 |
+| `delete` / `enable` / `disable` | `id` | 删除 / 暂停 / 恢复（仅 paused 可恢复） |
+| `run` | `id` | 手动立即触发（不占调度节奏） |
+| `history` | `id`、`limit` | 运行台账 |
+
+不进对话也有三个管理入口：
+
+- **Web/桌面设置中心「定时任务」tab**：任务卡片（状态徽标/调度/下次触发/最近
+  结果）+ 新建表单 + 启停/立即运行/删除/历史展开（REST：`/api/automations*`）；
+- **CLI**：`doge automation list|add|get|rm|enable|disable|run|history`——除
+  `run` 外都是直接写 automations.json 的文件操作，常驻进程 20s 内热生效；
+  `--every 20m|2h|3d|1w|2mo` / `--delay-minutes 120` / `--cron "0 9 * * 1"`；
+- **TUI**：`/automations [list|enable|disable|run|rm|history] [id]`。
+
+调度规则三选一：
+
+- `delayMinutes`：一次性延时（相对时间必须用它，别换算成 cron）；
+- `intervalUnit` + `interval`："每 N 分钟/小时/天/周/月"，从创建时刻锚点推导
+  （日/周/月级可加 `at:"HH:MM"`、`weekdays`、`monthDays`）；
+- `cron`：5 字段本地时区表达式，只用于用户点名的墙钟时刻（"每天 9 点"）。
+
+数据文件：`~/.doge/agent/automations.json`（定义 + 调度状态，0600，可手工
+编辑，运行中的 doge 20s 内热生效）；运行台账
+`~/.doge/agent/automations/runs.jsonl`（append-only，按 `historyRetentionDays`
+周期裁剪）。每次触发 fork 一个无人值守会话执行 prompt（按 `level` 裁剪工具
+级，ask 走 autoDecide 风险分级；会话在 TUI/Web 侧栏归组「定时任务会话」），
+结束后结果卡片回注来源会话。
+
+已知边界：**所有 doge 进程退出后任务不触发**，恢复运行时错过 >5 分钟的周期
+记 skipped 不补跑（一次性任务错过即完成）；需要 7×24 用
+`doge --web --no-tui` 常驻或桌面端托盘驻留。多进程并存靠文件认领单飞，
+同一任务同一时刻只跑一份。失败退避：临时错误 30s 指数退避重试（5 次为限），
+cwd/模型/密钥类错误直接转 failed 终态。
 
 ### 4.8 AGENTS.md —— 全局指令与项目上下文
 <!-- module: agents-md | 两层上下文文件：全局角色设定/环境定义 + 项目工作约定，注入系统提示词 -->

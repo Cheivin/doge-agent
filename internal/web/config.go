@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,7 +26,10 @@ var logDateRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(\.\d+)?$`)
 
 // handleConfigOverview reports where the agent's files live and what the
 // effective settings are — a management client's entry point, so it can render
-// configuration UIs without knowing the on-disk layout.
+// configuration UIs without knowing the on-disk layout. The `setup` node is
+// the first-run signal: it is always derived from the real config state
+// (usable models + default model), never from a completed-once marker, so
+// wiping the config or moving machines naturally re-triggers the wizard.
 func (s *Server) handleConfigOverview(w http.ResponseWriter, r *http.Request) {
 	cwd := s.defaultBackend.Status().Cwd
 	settings, err := coding.LoadSettings(coding.SettingsFile(), coding.ProjectSettingsFile(cwd))
@@ -33,6 +37,7 @@ func (s *Server) handleConfigOverview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	setup := SetupOverview(s.defaultBackend, settings.Settings)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     Version,
 		"agentDir":    coding.AgentDir(),
@@ -52,9 +57,113 @@ func (s *Server) handleConfigOverview(w http.ResponseWriter, r *http.Request) {
 			"mcpShared":       filepath.Join(cwd, ".mcp.json"),
 		},
 		"settings": settings.Settings,
+		"setup":    setup,
 		"mcp":      s.mcpOverview(),
 		"skills":   s.skillsOverview(),
 	})
+}
+
+// SetupOverview 组装就绪判定：有可用模型（密钥或本地端点任一）且已设默认模型。
+// 环境变量里的密钥同样计入可用（ResolveAPIKey 全链），不打扰环境变量用户。
+// Web 与桌面共用（桌面 Overview 同步该节）。
+func SetupOverview(b Backend, s coding.Settings) map[string]any {
+	hasUsable := b.HasUsableModel()
+	hasDefault := s.DefaultProvider != "" && s.DefaultModel != ""
+	return map[string]any{
+		"ready":           hasUsable && hasDefault,
+		"hasUsableModel":  hasUsable,
+		"hasDefaultModel": hasDefault,
+	}
+}
+
+// providerInfo /api/config/providers 的单条 provider 描述（引导页与密钥面板共用）
+type providerInfo struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	BaseURL     string   `json:"baseUrl,omitempty"`
+	RequiresKey bool     `json:"requiresKey"`
+	EnvKeys     []string `json:"envKeys,omitempty"`
+	// KeyConfigured 报告密钥已就绪（auth.json 或环境变量任一），前端徽标用
+	KeyConfigured bool `json:"keyConfigured"`
+}
+
+// handleConfigProviders lists the builtin provider catalog enriched with the
+// current key state — the data source for the first-run wizard ("也可用环境
+// 变量 XXX" 提示) and the settings keys panel. Read-only; setting keys is
+// POST /api/config/auth.
+func (s *Server) handleConfigProviders(w http.ResponseWriter, r *http.Request) {
+	keys, err := readAuthKeys()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// 自定义模型文件里出现过的 provider 一并补进目录（密钥面板可管理）
+	extra := map[string]bool{}
+	if custom, err := coding.LoadCustomModels(coding.ModelsFile()); err == nil {
+		for _, m := range custom {
+			if m != nil {
+				extra[m.Provider] = true
+			}
+		}
+	}
+	out := make([]providerInfo, 0, len(coding.BuiltinProviders())+len(extra))
+	for _, p := range coding.BuiltinProviders() {
+		delete(extra, p.ID)
+		out = append(out, providerInfo{
+			ID:            p.ID,
+			Name:          p.Name,
+			BaseURL:       p.BaseURL,
+			RequiresKey:   providerRequiresKey(p),
+			EnvKeys:       p.EnvKeys,
+			KeyConfigured: providerKeyReady(p, keys),
+		})
+	}
+	for id := range extra {
+		p := &ai.Provider{ID: id, EnvKeys: ai.EnvKeysFor(id)}
+		out = append(out, providerInfo{
+			ID:            p.ID,
+			Name:          p.ID,
+			RequiresKey:   true,
+			EnvKeys:       p.EnvKeys,
+			KeyConfigured: providerKeyReady(p, keys),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"providers": out})
+}
+
+// providerRequiresKey 判定 provider 是否需要密钥：本地端点（local 或
+// loopback baseUrl）免密，其余一律需要。内置远端 provider 未置 RequiresKey
+// （Stream 靠密钥解析判定），这里按 baseUrl 语义补齐。
+func providerRequiresKey(p *ai.Provider) bool {
+	if p.ID == "local" {
+		return false
+	}
+	if p.BaseURL == "" {
+		return true
+	}
+	u, err := url.Parse(p.BaseURL)
+	if err != nil {
+		return true
+	}
+	host := u.Hostname()
+	return host != "localhost" && host != "127.0.0.1" && host != "::1"
+}
+
+// providerKeyReady 判定 provider 密钥是否已就绪：auth.json 或环境变量任一；
+// 免密端点恒就绪
+func providerKeyReady(p *ai.Provider, keys map[string]string) bool {
+	if !providerRequiresKey(p) {
+		return true
+	}
+	if keys[p.ID] != "" {
+		return true
+	}
+	for _, env := range p.EnvKeys {
+		if os.Getenv(env) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // skillsOverview 返回 /api/config 的 skills 段：发现目录 + 已装技能名（供面板
@@ -254,8 +363,12 @@ func (s *Server) handleConfigModelsGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, custom)
 }
 
-// handleConfigModelsUpsert adds or replaces one custom model (matched by
-// provider+id), writes models.json back and hot-reloads the catalog.
+// handleConfigModelsUpsert adds or replaces one custom model, writes models.json
+// back and hot-reloads the catalog. The request may carry ?previous=provider/id:
+// an EDIT that renames provider/id then matches the OLD entry and replaces it
+// in place — without it a renamed edit appends a duplicate while the old entry
+// stays. After the reload, a live session still on the old spec is re-pointed
+// to the new one, so editing the active model takes effect everywhere at once.
 func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request) {
 	var m ai.Model
 	if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
@@ -265,6 +378,12 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 	if strings.TrimSpace(m.Provider) == "" || strings.TrimSpace(m.ID) == "" {
 		writeError(w, http.StatusBadRequest, "provider and id required")
 		return
+	}
+	prevProvider, prevID := "", ""
+	if v := r.URL.Query().Get("previous"); v != "" {
+		if idx := strings.Index(v, "/"); idx > 0 {
+			prevProvider, prevID = v[:idx], v[idx+1:]
+		}
 	}
 	path := coding.ModelsFile()
 	custom, err := coding.LoadCustomModels(path)
@@ -280,6 +399,17 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 			break
 		}
 	}
+	renameHit := false
+	if !replaced && prevProvider != "" {
+		for i, c := range custom {
+			if c.Provider == prevProvider && c.ID == prevID {
+				custom[i] = &m
+				replaced = true
+				renameHit = true
+				break
+			}
+		}
+	}
 	if !replaced {
 		custom = append(custom, &m)
 	}
@@ -288,7 +418,54 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 		return
 	}
 	logx.Infof("[web] models.json updated via API (%s/%s)", m.Provider, m.ID)
-	s.answerAfterConfigWrite(w, r)
+	resp := map[string]any{"ok": true, "reloaded": true}
+	if err := s.backendFor(r).ReloadConfig(); err != nil {
+		logx.Warnf("[web] reload after config write: %v", err)
+		resp["reloaded"] = false
+		resp["error"] = err.Error()
+	}
+	// 改名编辑且当前会话正用旧 key：立即切到新 spec（前端 fetchStatus 轮询
+	// 随即把按钮/徽标刷新成新信息）
+	renamed := renameHit && (prevProvider != m.Provider || prevID != m.ID)
+	if renamed && s.backendFor(r).Status().Model == prevProvider+"/"+prevID {
+		if err := s.backendFor(r).SwitchModel(m.Provider + "/" + m.ID); err != nil {
+			logx.Warnf("[web] re-point renamed model: %v", err)
+		}
+	}
+	// settings 默认模型指向旧 key：同步改指向（删除场景 newSpec 为空 = 清除，
+	// 启动 fallback 链接管），持久事实源不留失效引用
+	if renamed {
+		s.syncSettingsDefault(prevProvider+"/"+prevID, m.Provider+"/"+m.ID)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// syncSettingsDefault 模型改名/删除后同步全局 settings.json 的默认模型指向。
+// 默认未设置或指向别的模型时不动；写失败仅记日志（下次启动还有 fallback 链）。
+func (s *Server) syncSettingsDefault(oldSpec, newSpec string) {
+	cwd := s.defaultBackend.Status().Cwd
+	settings, err := coding.LoadSettings(coding.SettingsFile(), coding.ProjectSettingsFile(cwd))
+	if err != nil {
+		logx.Warnf("[web] sync settings default: %v", err)
+		return
+	}
+	cur := settings.Settings.DefaultProvider + "/" + settings.Settings.DefaultModel
+	if settings.Settings.DefaultProvider == "" || cur != oldSpec {
+		return
+	}
+	if newSpec != "" {
+		idx := strings.Index(newSpec, "/")
+		settings.Settings.DefaultProvider = newSpec[:idx]
+		settings.Settings.DefaultModel = newSpec[idx+1:]
+	} else {
+		settings.Settings.DefaultProvider = ""
+		settings.Settings.DefaultModel = ""
+	}
+	if err := coding.SaveSettings(coding.SettingsFile(), settings.Settings); err != nil {
+		logx.Warnf("[web] sync settings default: %v", err)
+		return
+	}
+	logx.Infof("[web] settings default model re-pointed: %s -> %s", oldSpec, newSpec)
 }
 
 // handleConfigModelsDelete removes one custom model from models.json and hot-
@@ -320,7 +497,30 @@ func (s *Server) handleConfigModelsDelete(w http.ResponseWriter, r *http.Request
 		return
 	}
 	logx.Infof("[web] models.json updated via API (removed %s/%s)", provider, id)
-	s.answerAfterConfigWrite(w, r)
+	resp := map[string]any{"ok": true, "reloaded": true}
+	if err := s.backendFor(r).ReloadConfig(); err != nil {
+		logx.Warnf("[web] reload after config write: %v", err)
+		resp["reloaded"] = false
+		resp["error"] = err.Error()
+	}
+	// 删除的是当前活跃模型：回退切到第一个可用模型，避免会话继续挂在已删
+	// 定义上（refreshCurrentModel 只保 identity 不变的条目）；settings 默认
+	// 指向被删模型时同步清除（fallback 链接管，持久层不留失效引用）
+	removedSpec := provider + "/" + id
+	if s.backendFor(r).Status().Model == removedSpec {
+		if avail := s.backendFor(r).ListModels(); len(avail) > 0 {
+			for _, m := range avail {
+				if m.Available {
+					if err := s.backendFor(r).SwitchModel(m.Spec); err != nil {
+						logx.Warnf("[web] fallback after model delete: %v", err)
+					}
+					break
+				}
+			}
+		}
+	}
+	s.syncSettingsDefault(removedSpec, "")
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleLogs tails the diagnostic log (logx): ?lines=N caps the count

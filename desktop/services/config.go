@@ -11,6 +11,7 @@ import (
 	"doge/internal/ai"
 	"doge/internal/coding"
 	"doge/internal/coding/permissions"
+	"doge/internal/web"
 	"doge/pkg/logx"
 )
 
@@ -70,6 +71,7 @@ func (s *ConfigService) Overview() (map[string]any, error) {
 			"mcpShared":       filepath.Join(cwd, ".mcp.json"),
 		},
 		"settings": settings.Settings,
+		"setup":    web.SetupOverview(s.d.Backend, settings.Settings),
 		"mcp":      mcpOverview,
 		"skills": map[string]any{
 			"dirs":  coding.SkillsDirs(cwd),
@@ -119,6 +121,48 @@ func (s *ConfigService) AuthGet() (map[string]any, error) {
 	return map[string]any{"providers": providers}, nil
 }
 
+// Providers 内置 provider 目录 + 密钥就绪状态（引导页/密钥面板数据源，与
+// Web GET /api/config/providers 同构）
+func (s *ConfigService) Providers() (map[string]any, error) {
+	keys, err := readAuthKeys()
+	if err != nil {
+		return nil, errInternal(err)
+	}
+	type info struct {
+		ID            string   `json:"id"`
+		Name          string   `json:"name"`
+		BaseURL       string   `json:"baseUrl,omitempty"`
+		RequiresKey   bool     `json:"requiresKey"`
+		EnvKeys       []string `json:"envKeys,omitempty"`
+		KeyConfigured bool     `json:"keyConfigured"`
+	}
+	out := make([]info, 0, 16)
+	for _, p := range coding.BuiltinProviders() {
+		out = append(out, info{
+			ID: p.ID, Name: p.Name, BaseURL: p.BaseURL,
+			RequiresKey: p.RequiresKey, EnvKeys: p.EnvKeys,
+			KeyConfigured: keyReady(p.ID, !p.RequiresKey, p.EnvKeys, keys),
+		})
+	}
+	return map[string]any{"providers": out}, nil
+}
+
+// keyReady 密钥就绪判定：auth.json 或环境变量任一
+func keyReady(id string, noKey bool, envs []string, keys map[string]string) bool {
+	if noKey {
+		return true
+	}
+	if keys[id] != "" {
+		return true
+	}
+	for _, env := range envs {
+		if os.Getenv(env) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // AuthSet 写入 provider API 密钥（空 key 等价删除）并热重载
 func (s *ConfigService) AuthSet(provider, key string) map[string]any {
 	provider = strings.TrimSpace(provider)
@@ -164,10 +208,18 @@ func (s *ConfigService) ModelsGet() ([]*ai.Model, error) {
 	return custom, nil
 }
 
-// ModelsUpsert 新增/替换一个自定义模型（provider+id 匹配）并热重载
-func (s *ConfigService) ModelsUpsert(m ai.Model) map[string]any {
+// ModelsUpsert 新增/替换一个自定义模型（provider+id 匹配）并热重载。
+// previous 非空（"provider/id"）表示改名编辑：替换旧条目而非追加重复，
+// 当前会话落在旧 key 上时同步切到新 spec。
+func (s *ConfigService) ModelsUpsert(m ai.Model, previous string) map[string]any {
 	if strings.TrimSpace(m.Provider) == "" || strings.TrimSpace(m.ID) == "" {
 		return map[string]any{"ok": false, "reloaded": false, "error": "provider and id required"}
+	}
+	prevProvider, prevID := "", ""
+	if v := strings.TrimPrefix(strings.TrimSpace(previous), "/"); v != "" && strings.Contains(v, "/") {
+		if idx := strings.Index(v, "/"); idx > 0 {
+			prevProvider, prevID = v[:idx], v[idx+1:]
+		}
 	}
 	path := coding.ModelsFile()
 	custom, err := coding.LoadCustomModels(path)
@@ -182,6 +234,17 @@ func (s *ConfigService) ModelsUpsert(m ai.Model) map[string]any {
 			break
 		}
 	}
+	renameHit := false
+	if !replaced && prevProvider != "" {
+		for i, c := range custom {
+			if c.Provider == prevProvider && c.ID == prevID {
+				custom[i] = &m
+				replaced = true
+				renameHit = true
+				break
+			}
+		}
+	}
 	if !replaced {
 		custom = append(custom, &m)
 	}
@@ -189,10 +252,49 @@ func (s *ConfigService) ModelsUpsert(m ai.Model) map[string]any {
 		return map[string]any{"ok": false, "reloaded": false, "error": err.Error()}
 	}
 	logx.Infof("[desktop] models.json updated via service (%s/%s)", m.Provider, m.ID)
-	return reloadAnswer(s.d)
+	resp := reloadAnswer(s.d)
+	renamed := renameHit && (prevProvider != m.Provider || prevID != m.ID)
+	if renamed && s.d.Backend.Status().Model == prevProvider+"/"+prevID {
+		if err := s.d.Backend.SwitchModel(m.Provider + "/" + m.ID); err != nil {
+			logx.Warnf("[desktop] re-point renamed model: %v", err)
+		}
+	}
+	if renamed {
+		s.syncSettingsDefault(prevProvider+"/"+prevID, m.Provider+"/"+m.ID)
+	}
+	return resp
 }
 
-// ModelsDelete 删除自定义模型（内置模型拒绝）并热重载
+// syncSettingsDefault 模型改名/删除后同步全局 settings.json 的默认模型指向
+// （与 Web 同构）；newSpec 为空表示清除，启动 fallback 链接管
+func (s *ConfigService) syncSettingsDefault(oldSpec, newSpec string) {
+	cwd := s.d.Backend.Status().Cwd
+	settings, err := coding.LoadSettings(coding.SettingsFile(), coding.ProjectSettingsFile(cwd))
+	if err != nil {
+		logx.Warnf("[desktop] sync settings default: %v", err)
+		return
+	}
+	cur := settings.Settings.DefaultProvider + "/" + settings.Settings.DefaultModel
+	if settings.Settings.DefaultProvider == "" || cur != oldSpec {
+		return
+	}
+	if newSpec != "" {
+		idx := strings.Index(newSpec, "/")
+		settings.Settings.DefaultProvider = newSpec[:idx]
+		settings.Settings.DefaultModel = newSpec[idx+1:]
+	} else {
+		settings.Settings.DefaultProvider = ""
+		settings.Settings.DefaultModel = ""
+	}
+	if err := coding.SaveSettings(coding.SettingsFile(), settings.Settings); err != nil {
+		logx.Warnf("[desktop] sync settings default: %v", err)
+		return
+	}
+	logx.Infof("[desktop] settings default model re-pointed: %s -> %s", oldSpec, newSpec)
+}
+
+// ModelsDelete 删除自定义模型（内置模型拒绝）并热重载；删除的是当前活跃
+// 模型时回退切到第一个可用模型
 func (s *ConfigService) ModelsDelete(provider, id string) map[string]any {
 	start := time.Now()
 	path := coding.ModelsFile()
@@ -218,7 +320,19 @@ func (s *ConfigService) ModelsDelete(provider, id string) map[string]any {
 		return map[string]any{"ok": false, "reloaded": false, "error": err.Error()}
 	}
 	logx.Infof("[desktop] models.json updated via service (removed %s/%s)", provider, id)
-	return reloadAnswer(s.d)
+	resp := reloadAnswer(s.d)
+	if s.d.Backend.Status().Model == provider+"/"+id {
+		for _, m := range s.d.Backend.ListModels() {
+			if m.Available {
+				if err := s.d.Backend.SwitchModel(m.Spec); err != nil {
+					logx.Warnf("[desktop] fallback after model delete: %v", err)
+				}
+				break
+			}
+		}
+	}
+	s.syncSettingsDefault(provider+"/"+id, "")
+	return resp
 }
 
 // Reload 重读 models/auth/permissions 并落地会话级 MCP 开关

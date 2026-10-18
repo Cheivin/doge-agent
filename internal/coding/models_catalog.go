@@ -122,15 +122,31 @@ func SaveCustomModels(modelsFile string, models []*ai.Model) error {
 	return os.WriteFile(modelsFile, append(data, '\n'), 0o644)
 }
 
+// builtinProviders 内置 provider 目录（EnvKeys 供引导页展示环境变量名）。
+// 远端 provider 一律 RequiresKey：无密钥时 Stream 即刻报 MissingAPIKeyError
+// 指路设置/环境变量，而不是带空 key 硬打网关等 401/超时（local 免密除外）。
+var builtinProviders = []*ai.Provider{
+	{ID: "openai", Name: "OpenAI", BaseURL: "https://api.openai.com/v1", EnvKeys: ai.EnvKeysFor("openai"), RequiresKey: true},
+	{ID: "anthropic", Name: "Anthropic", BaseURL: "https://api.anthropic.com/v1", EnvKeys: ai.EnvKeysFor("anthropic"), RequiresKey: true},
+	{ID: "deepseek", Name: "DeepSeek", BaseURL: "https://api.deepseek.com/v1", EnvKeys: ai.EnvKeysFor("deepseek"), RequiresKey: true},
+	{ID: "qwen", Name: "Qwen", BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", EnvKeys: ai.EnvKeysFor("qwen"), RequiresKey: true},
+	{ID: "moonshot", Name: "Moonshot", BaseURL: "https://api.moonshot.cn/v1", EnvKeys: ai.EnvKeysFor("moonshot"), RequiresKey: true},
+	{ID: "zhipu", Name: "Zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", EnvKeys: ai.EnvKeysFor("zhipu"), RequiresKey: true},
+	{ID: "zai", Name: "Z.ai", BaseURL: "https://api.z.ai/api/paas/v4", EnvKeys: ai.EnvKeysFor("zai"), RequiresKey: true},
+	{ID: "openrouter", Name: "OpenRouter", BaseURL: "https://openrouter.ai/api/v1", EnvKeys: ai.EnvKeysFor("openrouter"), RequiresKey: true},
+	{ID: "local", Name: "Local", RequiresKey: false},
+}
+
+// BuiltinProviders 返回内置 provider 目录快照（引导页/密钥面板数据源）
+func BuiltinProviders() []*ai.Provider {
+	out := make([]*ai.Provider, len(builtinProviders))
+	copy(out, builtinProviders)
+	return out
+}
+
 // RegisterBuiltinProviders adds the providers for the builtin models.
 func RegisterBuiltinProviders(models *ai.Models) {
-	models.AddProvider(&ai.Provider{ID: "openai", Name: "OpenAI", BaseURL: "https://api.openai.com/v1"})
-	models.AddProvider(&ai.Provider{ID: "anthropic", Name: "Anthropic", BaseURL: "https://api.anthropic.com/v1"})
-	models.AddProvider(&ai.Provider{ID: "deepseek", Name: "DeepSeek", BaseURL: "https://api.deepseek.com/v1"})
-	models.AddProvider(&ai.Provider{ID: "qwen", Name: "Qwen", BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"})
-	models.AddProvider(&ai.Provider{ID: "moonshot", Name: "Moonshot", BaseURL: "https://api.moonshot.cn/v1"})
-	models.AddProvider(&ai.Provider{ID: "zhipu", Name: "Zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4"})
-	models.AddProvider(&ai.Provider{ID: "zai", Name: "Z.ai", BaseURL: "https://api.z.ai/api/paas/v4"})
-	models.AddProvider(&ai.Provider{ID: "openrouter", Name: "OpenRouter", BaseURL: "https://openrouter.ai/api/v1"})
-	models.AddProvider(&ai.Provider{ID: "local", Name: "Local", RequiresKey: false})
+	for _, p := range builtinProviders {
+		models.AddProvider(p)
+	}
 }

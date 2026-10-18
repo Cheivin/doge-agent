@@ -155,9 +155,10 @@ func (m *Models) AvailableModels() []*Model {
 
 // usable reports whether a model can stream without a missing-key error:
 // either a key resolves (stored credential or environment variable) or the
-// endpoint is a local one that needs no key. Built-in remote providers leave
-// RequiresKey unset, so availability is decided purely by credential
-// resolution and the local-endpoint rule — exactly what Stream will accept.
+// endpoint is a local one that needs no key. Builtin remote providers set
+// RequiresKey, so Stream rejects keyless requests with guidance; availability
+// mirrors that rule — a selectable model never fails at request time for want
+// of credentials.
 func (m *Models) usable(model *Model) bool {
 	if model == nil {
 		return false

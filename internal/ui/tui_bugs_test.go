@@ -23,7 +23,7 @@ func (s *recordingSession) Prompt(text string) error {
 // Bug: successful slash commands leave "✓ ..." status, keeping busy() true so
 // the spinner animates forever even though nothing is running.
 func TestBusyClearedAfterCompletedStatus(t *testing.T) {
-	m := newModel(&agentSessionStub{}, nil, nil, "")
+	m := newModel(&agentSessionStub{}, nil, nil, nil, "")
 	for _, status := range []string{
 		"✓ 已重载 models.json / auth.json / permission.json",
 		"✓ 已切换模型",
@@ -48,7 +48,7 @@ func TestBusyClearedAfterCompletedStatus(t *testing.T) {
 // active.
 func TestEscIdleDoesNotAbort(t *testing.T) {
 	sess := &recordingSession{agentSessionStub: &agentSessionStub{}}
-	m := newModel(sess, nil, nil, "")
+	m := newModel(sess, nil, nil, nil, "")
 	m.status = "✓ 已重载 models.json / auth.json / permission.json"
 
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
@@ -64,7 +64,7 @@ func TestEscIdleDoesNotAbort(t *testing.T) {
 // Guard: ESC during an active run must still abort.
 func TestEscAbortsActiveRun(t *testing.T) {
 	sess := &recordingSession{agentSessionStub: &agentSessionStub{}}
-	m := newModel(sess, nil, nil, "")
+	m := newModel(sess, nil, nil, nil, "")
 	m.runActive = true
 	m.status = "→ bash"
 
@@ -143,7 +143,7 @@ func TestInputBoxMultilinePaste(t *testing.T) {
 // Bug: shift+enter in the model must insert a newline without submitting.
 func TestModelShiftEnterInsertsNewline(t *testing.T) {
 	sess := &recordingSession{agentSessionStub: &agentSessionStub{}}
-	m := newModel(sess, nil, nil, "")
+	m := newModel(sess, nil, nil, nil, "")
 	m.input.Focus()
 	m.input.SetValue("hello")
 

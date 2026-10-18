@@ -77,10 +77,12 @@ func main() {
 	}
 
 	// 装配：模型运行时、会话、技能、上传暂存区、mesh、MCP
+	// 桌面端常驻（托盘驻留）：定时任务调度器挂载
 	a, err := app.Assemble(env, app.Options{
 		Version:   versionString(),
 		Mesh:      meshFlag,
 		MeshToken: meshToken,
+		Scheduler: true,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "doge: %v\n", err)
@@ -120,6 +122,7 @@ func main() {
 	gui.RegisterService(application.NewServiceWithOptions(svcs.Skills, svcOpt))
 	gui.RegisterService(application.NewServiceWithOptions(svcs.Mesh, svcOpt))
 	gui.RegisterService(application.NewServiceWithOptions(svcs.Uploads, svcOpt))
+	gui.RegisterService(application.NewServiceWithOptions(svcs.Automations, svcOpt))
 
 	// 前端启动诊断通道：JS 报错经 Events 回传落日志（排查黑屏类问题）
 	gui.Event.On("js:err", func(e *application.CustomEvent) {

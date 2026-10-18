@@ -32,6 +32,7 @@ type Options struct {
 	Address     string         // 监听地址，如 "127.0.0.1:8080"
 	Mesh        MeshView       // mesh 网络视图，nil 则隐藏面板
 	Mcp         McpView        // MCP 管理器视图
+	Automations AutomationView // 定时任务管理面，nil 则 /api/automations 503
 	CorsOrigins []string       // CORS 允许的源，"*" 允许所有
 	Shutdown    func()         // 关闭回调，nil 则 503
 	Uploads     *uploads.Store // 上传暂存区，nil 则上传接口 503
@@ -98,6 +99,9 @@ type Server struct {
 	// mcpView backs the MCP endpoints (nil = MCP disabled/not initialized).
 	mcpView McpView
 
+	// automations backs the automations endpoints (nil = /api/automations 503).
+	automations AutomationView
+
 	// shutdown backs POST /api/shutdown (nil = endpoint answers 503).
 	shutdown func()
 
@@ -162,6 +166,7 @@ func NewServer(opts Options) (*Server, error) {
 		addr:           addr,
 		meshView:       opts.Mesh,
 		mcpView:        opts.Mcp,
+		automations:    opts.Automations,
 		shutdown:       opts.Shutdown,
 		uploads:        opts.Uploads,
 		corsOrigins:    opts.CorsOrigins,
@@ -415,6 +420,7 @@ func (s *Server) handler() http.Handler {
 	// agent 配置与诊断
 	mux.Handle("GET /api/fs/ls", s.requireAuth(s.handleFsList))
 	mux.Handle("GET /api/config", s.requireAuth(s.handleConfigOverview))
+	mux.Handle("GET /api/config/providers", s.requireAuth(s.handleConfigProviders))
 	mux.Handle("GET /api/config/settings", s.requireAuth(s.handleSettingsGet))
 	mux.Handle("PUT /api/config/settings", s.requireAuth(s.handleSettingsPut))
 	mux.Handle("GET /api/config/auth", s.requireAuth(s.handleAuthGet))
@@ -424,6 +430,17 @@ func (s *Server) handler() http.Handler {
 	mux.Handle("POST /api/config/models", s.requireAuth(s.handleConfigModelsUpsert))
 	mux.Handle("DELETE /api/config/models/{provider}/{id}", s.requireAuth(s.handleConfigModelsDelete))
 	mux.Handle("GET /api/logs", s.requireAuth(s.handleLogs))
+
+	// Automations: 定时任务管理面（任务卡片 / 建/改/删 / 启停 / 手动触发 / 台账）
+	mux.Handle("GET /api/automations", s.requireAuth(s.handleAutomationsList))
+	mux.Handle("POST /api/automations", s.requireAuth(s.handleAutomationsCreate))
+	mux.Handle("GET /api/automations/{id}", s.requireAuth(s.handleAutomationsGet))
+	mux.Handle("PATCH /api/automations/{id}", s.requireAuth(s.handleAutomationsPatch))
+	mux.Handle("DELETE /api/automations/{id}", s.requireAuth(s.handleAutomationsDelete))
+	mux.Handle("POST /api/automations/{id}/run", s.requireAuth(s.handleAutomationsRun))
+	mux.Handle("POST /api/automations/{id}/enable", s.requireAuth(s.handleAutomationsSetEnabled(true)))
+	mux.Handle("POST /api/automations/{id}/disable", s.requireAuth(s.handleAutomationsSetEnabled(false)))
+	mux.Handle("GET /api/automations/{id}/runs", s.requireAuth(s.handleAutomationsRuns))
 
 	mux.Handle("POST /api/shutdown", s.requireAuth(s.handleShutdown))
 	mux.Handle("GET /ws", s.requireAuth(s.hub.serveWS))

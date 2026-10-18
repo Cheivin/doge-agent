@@ -16,6 +16,7 @@ import (
 	"doge/internal/agent"
 	"doge/internal/ai"
 	"doge/internal/coding"
+	"doge/internal/coding/automation"
 	"doge/internal/coding/permissions"
 	"doge/internal/mcp"
 	"doge/internal/mesh"
@@ -46,6 +47,7 @@ var cmdMenuItems = []cmdMenuItem{
 	{cmd: "/open", desc: "打开指定会话 <id>", needsArgs: true},
 	{cmd: "/stats", desc: "会话 token 统计"},
 	{cmd: "/reload", desc: "重新加载 models/auth/permission 配置"},
+	{cmd: "/automations", desc: "定时任务 列表/启停/删除/立即运行"},
 	{cmd: "/help", desc: "命令帮助"},
 }
 
@@ -141,11 +143,22 @@ type mcpView interface {
 	Setup() error
 }
 
+// automationView is the subset of the automation manager the TUI needs (the
+// /automations command). *automation.API satisfies it structurally.
+type automationView interface {
+	List() ([]*automation.Automation, error)
+	Delete(id string) error
+	SetEnabled(id string, enabled bool) (*automation.Automation, error)
+	Run(id string) (string, error)
+	History(id string, limit int) ([]*automation.Run, error)
+}
+
 // model is the root bubbletea model: message stream + input + footer.
 type model struct {
 	sess    sessionLike
 	mesh    meshView
 	mcp     mcpView
+	autos   automationView
 	program *tea.Program
 
 	mu          sync.Mutex
@@ -264,8 +277,8 @@ type msgRender struct {
 }
 
 // Run starts the interactive UI for a session and blocks until exit.
-func Run(sess *coding.AgentSession, mesh meshView, mcp mcpView, version, initialMessage string) {
-	m := newModel(sess, mesh, mcp, version)
+func Run(sess *coding.AgentSession, mesh meshView, mcp mcpView, autos automationView, version, initialMessage string) {
+	m := newModel(sess, mesh, mcp, autos, version)
 	// v2 is declarative: alt screen, mouse mode, and keyboard enhancements
 	// are requested per-frame from View(); no program options needed here.
 	p := tea.NewProgram(m)
@@ -281,12 +294,13 @@ func Run(sess *coding.AgentSession, mesh meshView, mcp mcpView, version, initial
 	}
 }
 
-func newModel(sess sessionLike, mesh meshView, mcp mcpView, version string) *model {
+func newModel(sess sessionLike, mesh meshView, mcp mcpView, autos automationView, version string) *model {
 	cwd, _ := os.Getwd()
 	m := &model{
 		sess:             sess,
 		mesh:             mesh,
 		mcp:              mcp,
+		autos:            autos,
 		toolOutputs:      map[string]string{},
 		input:            newInputBox(),
 		expandedThinking: map[string]bool{},
@@ -729,7 +743,7 @@ func (m *model) runSlashCommand(line string) tea.Cmd {
 	case "/quit", "/exit":
 		return tea.Quit
 	case "/help":
-		m.status = "命令: /quit /exit /model <spec> /compact /new /sessions /open <id> /stats /reload /help；/ 菜单内 Tab 补全；/sessions 内 d 删除"
+		m.status = "命令: /quit /exit /model <spec> /compact /new /sessions /open <id> /stats /reload /automations /help；/ 菜单内 Tab 补全；/sessions 内 d 删除"
 	case "/reload":
 		if err := m.sess.ReloadConfig(); err != nil {
 			m.status = "✗ 重载配置失败: " + err.Error()
@@ -780,6 +794,8 @@ func (m *model) runSlashCommand(line string) tea.Cmd {
 		m.showMesh()
 	case "/mcp":
 		m.showMcp(args)
+	case "/automations":
+		m.showAutomations(args)
 	case "/stats":
 		st := coding.ComputeSessionStats(m.messages, m.sess.CostPolicyFor)
 		st.SessionID = m.sess.CurrentSessionID()
@@ -882,7 +898,7 @@ func (m *model) loadSessionPicker() bool {
 		if s.Cwd != m.sess.GetCwd() {
 			continue // TUI switches only within the current directory
 		}
-		if s.Kind == coding.SessionKindRemote {
+		if s.Kind == coding.SessionKindRemote || s.Kind == coding.SessionKindAutomation {
 			if !m.showRemoteSessions {
 				remoteHidden++
 				continue
@@ -892,6 +908,9 @@ func (m *model) loadSessionPicker() bool {
 		label := fmt.Sprintf("#%s  %d 条  %s", shortID(s.ID), s.MessageCount, s.Timestamp.Format("01-02 15:04"))
 		if s.Kind == coding.SessionKindRemote {
 			label = "[远端] " + label
+		}
+		if s.Kind == coding.SessionKindAutomation {
+			label = "[定时] " + label
 		}
 		if preview != "" {
 			label += "  " + preview
@@ -961,6 +980,143 @@ func dashOr(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// showAutomations renders the automation list / executes the /automations
+// subcommands（照 /mcp 的子命令 + 状态面板模式）.
+//   - /automations, /automations list   面板：任务/调度/下次/状态/计数
+//   - /automations disable|enable <id>  暂停 / 恢复
+//   - /automations run <id>             立即手动触发（异步）
+//   - /automations rm <id>              删除
+//   - /automations history <id>         运行台账
+func (m *model) showAutomations(args string) {
+	if m.autos == nil {
+		m.status = "定时任务未启用（本进程未装配管理面）"
+		return
+	}
+	fields := strings.Fields(args)
+	sub := "list"
+	if len(fields) > 0 {
+		sub = fields[0]
+	}
+	arg := ""
+	if len(fields) > 1 {
+		arg = fields[1]
+	}
+	switch sub {
+	case "", "list":
+		list, err := m.autos.List()
+		if err != nil {
+			m.status = "✗ " + err.Error()
+			return
+		}
+		if len(list) == 0 {
+			m.status = "暂无定时任务（对话内让模型创建，或 doge automation add）"
+			return
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "⏱ 定时任务 %d 个：\n", len(list))
+		for _, a := range list {
+			state := a.Status
+			if a.Running {
+				state += "(运行中)"
+			}
+			fmt.Fprintf(&b, "  %s  %s\n", a.ID, truncateRunesUI(a.Title, 28))
+			fmt.Fprintf(&b, "    %s  下次 %s  [%s]  定时 %d/%d 次\n",
+				describeScheduleUI(a.Schedule), formatUnixUI(a.NextRunAt), state, a.ScheduledRunCount, a.RunCountTotal)
+		}
+		b.WriteString(muted("（enable/disable/run/rm/history <id> 管理；对话内可直接自然语言建任务）"))
+		m.status = strings.TrimSuffix(b.String(), "\n")
+	case "enable", "disable":
+		if arg == "" {
+			m.status = "用法: /automations " + sub + " <id>"
+			return
+		}
+		a, err := m.autos.SetEnabled(arg, sub == "enable")
+		if err != nil {
+			m.status = "✗ " + err.Error()
+			return
+		}
+		m.status = "✓ " + a.ID + " → " + a.Status + "（下次 " + formatUnixUI(a.NextRunAt) + "）"
+	case "run":
+		if arg == "" {
+			m.status = "用法: /automations run <id>"
+			return
+		}
+		if _, err := m.autos.Run(arg); err != nil {
+			m.status = "✗ " + err.Error()
+			return
+		}
+		m.status = "✓ 已触发手动运行 " + arg + "（后台执行，/automations history " + arg + " 查看结果）"
+	case "rm":
+		if arg == "" {
+			m.status = "用法: /automations rm <id>"
+			return
+		}
+		if err := m.autos.Delete(arg); err != nil {
+			m.status = "✗ " + err.Error()
+			return
+		}
+		m.status = "✓ 已删除 " + arg
+	case "history":
+		if arg == "" {
+			m.status = "用法: /automations history <id>"
+			return
+		}
+		runs, err := m.autos.History(arg, 10)
+		if err != nil {
+			m.status = "✗ " + err.Error()
+			return
+		}
+		if len(runs) == 0 {
+			m.status = arg + " 暂无运行记录"
+			return
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "⏱ %s 运行记录：\n", arg)
+		for _, run := range runs {
+			fmt.Fprintf(&b, "  %s  %-9s  %s\n", formatUnixUI(run.StartedAt), run.Outcome, dashOr(truncateRunesUI(run.Error, 40)))
+		}
+		m.status = strings.TrimSuffix(b.String(), "\n")
+	default:
+		m.status = "用法: /automations [list|enable|disable|run|rm|history] [id]"
+	}
+}
+
+// describeScheduleUI 调度可读描述（TUI 面板用）
+func describeScheduleUI(sc automation.Schedule) string {
+	switch sc.Kind {
+	case automation.ScheduleDelay:
+		return fmt.Sprintf("%d 分钟后一次性", sc.DelayMinutes)
+	case automation.ScheduleInterval:
+		unit := map[string]string{"minute": "分钟", "hour": "小时", "day": "天", "week": "周", "month": "月"}[sc.IntervalUnit]
+		if unit == "" {
+			unit = sc.IntervalUnit
+		}
+		desc := fmt.Sprintf("每 %d %s", sc.Interval, unit)
+		if sc.At != "" {
+			desc += " " + sc.At
+		}
+		if len(sc.Weekdays) > 0 {
+			names := []string{}
+			for _, w := range sc.Weekdays {
+				names = append(names, []string{"日", "一", "二", "三", "四", "五", "六"}[w%7])
+			}
+			desc += " 周" + strings.Join(names, "/")
+		}
+		return desc
+	case automation.ScheduleCron:
+		return "cron " + sc.Cron
+	}
+	return "未知调度"
+}
+
+// formatUnixUI Unix 秒的本地可读时刻
+func formatUnixUI(ts int64) string {
+	if ts == 0 {
+		return "-"
+	}
+	return time.Unix(ts, 0).Format("01-02 15:04")
 }
 
 // showMcp renders the MCP state / executes the /mcp subcommands.

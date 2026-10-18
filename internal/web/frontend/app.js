@@ -125,6 +125,7 @@ function enterApp() {
   populateSessions();
   connectWS();
   fetchStatus(); // 进场立即拉一次状态（cwd/模型/思考级别）
+  checkSetup(); // 首跑配置检测：无可用模型出向导，有模型没默认模型出横幅
   // 周期刷新状态：提供商卡住/流自愈结束这类没有事件驱动的变化也能及时反映到 UI，
   // 避免看起来"假死"。
   setInterval(fetchStatus, 5000);
@@ -341,11 +342,11 @@ function populateSessions() {
       const list = $("#sess-list");
       list.textContent = "";
       const sessions = (j.sessions || []).slice(0, 50); // newest first
-      // Keep the user's own sessions and the slave's remote-task forks apart:
-      // remote sessions go into a collapsible section so they never clutter the
-      // normal list, but stay reachable for inspection.
-      const userSess = sessions.filter((s) => s.kind !== "remote");
+      // 用户自己的会话与无人值守 fork（远端任务/定时任务）分开：后者折叠成
+      // 分组，不占正常列表但保留查看入口
+      const userSess = sessions.filter((s) => s.kind !== "remote" && s.kind !== "automation");
       const remoteSess = sessions.filter((s) => s.kind === "remote");
+      const autoSess = sessions.filter((s) => s.kind === "automation");
 
       const makeItem = (s) => {
         const item = document.createElement("div");
@@ -453,6 +454,19 @@ function populateSessions() {
         const box = document.createElement("div");
         box.className = "sess-remote hidden";
         for (const s of remoteSess) box.appendChild(makeItem(s));
+        head.addEventListener("click", () => box.classList.toggle("hidden"));
+        list.appendChild(head);
+        list.appendChild(box);
+      }
+
+      if (autoSess.length) {
+        const head = document.createElement("div");
+        head.className = "sess-remote-head";
+        head.textContent = "定时任务会话 (" + autoSess.length + ")";
+        head.title = "点击展开/收起由定时任务创建的会话";
+        const box = document.createElement("div");
+        box.className = "sess-remote hidden";
+        for (const s of autoSess) box.appendChild(makeItem(s));
         head.addEventListener("click", () => box.classList.toggle("hidden"));
         list.appendChild(head);
         list.appendChild(box);
@@ -1454,6 +1468,8 @@ function openModelMenu(anchor) {
       if ((m.input || []).includes("image")) badges.appendChild(menuBadge("视觉"));
       if (m.reasoning) badges.appendChild(menuBadge("推理"));
       if (m.contextWindow >= 1e6) badges.appendChild(menuBadge("1M"));
+      // 兜底追加的当前模型实际不可用（无密钥）：标注而非误导"有模型"
+      if (m.available === false) badges.appendChild(menuBadge("未配置密钥"));
       if (badges.childNodes.length) item.appendChild(badges);
       if (m.spec === state.modelSpec) {
         const check = document.createElement("span");
@@ -3006,7 +3022,7 @@ function skillRow(sk, installed) {
 }
 
 /* ---------------- 设置中心：模型 / MCP / 技能 ---------------- */
-const settingsTabs = { models: "模型", mcp: "MCP 服务器", skills: "技能", mesh: "Mesh 网络" };
+const settingsTabs = { models: "模型", keys: "密钥", auto: "定时任务", mcp: "MCP 服务器", skills: "技能", mesh: "Mesh 网络" };
 let settingsModelProvider = ""; // 模型 tab 当前选中的 provider
 
 function openSettings(tab) {
@@ -3019,6 +3035,8 @@ function openSettings(tab) {
   }
   $("#settings-title").textContent = settingsTabs[tab];
   if (tab === "models") loadSettingsModels();
+  else if (tab === "keys") loadSettingsKeys();
+  else if (tab === "auto") loadSettingsAuto();
   else if (tab === "mcp") openMcp();
   else if (tab === "mesh") openMesh();
   else openSkills();
@@ -3055,10 +3073,44 @@ function renderSettingsModels(custom) {
     settingsModelProvider = providers[0] || "";
   }
 
-  const wrap = document.createElement("div");
-  wrap.className = "model-split";
-  const nav = document.createElement("div");
-  nav.className = "model-providers";
+  // 顶部默认模型选择（独立整行，位于双列布局之上）：settings 管下次启动，
+  // /api/model 管当前会话（双写）
+  const defBar = document.createElement("div");
+  defBar.className = "default-model-bar";
+  const defLabel = document.createElement("span");
+  defLabel.textContent = "默认模型";
+  defBar.appendChild(defLabel);
+  const defSel = document.createElement("select");
+  const defFill = () => {
+    defSel.textContent = "";
+    api("/api/config/settings", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((doc) => {
+        const st = doc && doc.settings ? doc.settings : null;
+        const cur = st && st.defaultProvider && st.defaultModel ? st.defaultProvider + "/" + st.defaultModel : "";
+        const opts = [];
+        if (cur) opts.push(cur);
+        for (const m of state.models) {
+          if (m.available !== false && !opts.includes(m.spec)) opts.push(m.spec);
+        }
+        for (const spec of opts) {
+          const opt = document.createElement("option");
+          opt.value = spec;
+          opt.textContent = spec;
+          if (spec === cur) opt.selected = true;
+          defSel.appendChild(opt);
+        }
+      })
+      .catch(() => {});
+  };
+  defFill();
+  defBar.appendChild(defSel);
+  defBar.title = "新会话/下次启动使用的模型；修改后当前会话立即切换";
+  defSel.addEventListener("change", () => {
+    if (!defSel.value) return;
+    applyDefaultModel(defSel.value, true).then(loadModels).catch((e) => setStatusText(String(e.message || e)));
+  });
+
   for (const p of providers) {
     const b = document.createElement("button");
     b.className = "model-provider" + (p === settingsModelProvider ? " current" : "");
@@ -3104,6 +3156,7 @@ function renderSettingsModels(custom) {
     if (m.provider !== settingsModelProvider) continue;
     list.appendChild(modelRow(m, customMap.get(m.provider + "/" + m.id) || null));
   }
+  body.appendChild(defBar);
   wrap.appendChild(nav);
   wrap.appendChild(list);
   body.appendChild(wrap);
@@ -3210,7 +3263,12 @@ function saveModelForm(orig) {
     reasoning: $("#mf-reasoning").checked,
   };
   if (orig && orig.cost) def.cost = orig.cost; // 编辑保留原计费配置
-  api("/api/config/models", {
+  // 改名编辑带 previous（旧 provider/id），后端替换旧条目而非追加重复
+  let url = "/api/config/models";
+  if (orig && (orig.provider !== provider || orig.id !== id)) {
+    url += "?previous=" + encodeURIComponent(orig.provider + "/" + orig.id);
+  }
+  api(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(def),
@@ -3219,10 +3277,1083 @@ function saveModelForm(orig) {
       if (!r.ok) throw new Error((await r.json()).error || "保存失败");
       $("#model-form").classList.add("hidden");
       setStatusText("模型已保存：" + provider + "/" + id);
+      // 全局刷新：设置面板 / 可用模型列表 / 当前模型按钮与徽标
       loadSettingsModels();
       loadModels();
+      fetchStatus();
     })
     .catch((e) => setStatusText(String(e.message || e)));
+}
+
+/* ---------------- 首跑配置向导与密钥管理 ---------------- */
+
+// checkSetup 首跑配置检测：就绪与否从真实状态推导（setup 节由后端计算，无
+// 哨兵文件）。!hasUsableModel → 四步向导（S1）；有模型没默认模型 → 一步式
+// 横幅（S2，可关）。会话里已有配置时不打扰。
+function checkSetup() {
+  api("/api/config", { credentials: "same-origin" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((cfg) => {
+      if (!cfg || !cfg.setup || cfg.setup.ready) return;
+      if (!cfg.setup.hasUsableModel) openSetupWizard(cfg);
+      else if (!cfg.setup.hasDefaultModel) openDefaultModelBanner();
+    })
+    .catch(() => {});
+}
+
+// 向导状态机：step 1 选服务商 → 2 粘 key（自定义路径含 baseUrl/模型 id）→
+// 3 选默认模型 → 4 写入（四个既有 API 串联，后端零新增写路径）
+const wizardState = { step: 1, provider: null, custom: false, key: "", modelSpec: "", baseUrl: "", modelId: "", apiType: "openai-completions", cfg: null };
+
+function openSetupWizard(cfg) {
+  wizardState.step = 1;
+  wizardState.cfg = cfg;
+  wizardState.provider = null;
+  wizardState.custom = false;
+  wizardState.key = "";
+  wizardState.modelSpec = "";
+  wizardState.baseUrl = "";
+  wizardState.modelId = "";
+  wizardState.apiType = "openai-completions";
+  renderWizard();
+  $("#setup").classList.remove("hidden");
+}
+
+function closeSetup() {
+  $("#setup").classList.add("hidden");
+  $("#setup").textContent = "";
+}
+
+// loadProvidersCatalog 内置 provider 目录（含密钥就绪态与环境变量名）
+function loadProvidersCatalog() {
+  return api("/api/config/providers", { credentials: "same-origin" })
+    .then((r) => (r.ok ? r.json() : { providers: [] }))
+    .then((j) => j.providers || []);
+}
+
+// loadAllModelsCatalog 全模型目录（?all=1，向导选默认模型用）
+function loadAllModelsCatalog() {
+  return api("/api/models?all=1", { credentials: "same-origin" })
+    .then((r) => (r.ok ? r.json() : { models: [] }))
+    .then((j) => j.models || []);
+}
+
+function renderWizard() {
+  const box = $("#setup");
+  box.textContent = "";
+  const card = document.createElement("div");
+  card.className = "setup-card";
+  const head = document.createElement("div");
+  head.className = "setup-head";
+  const title = document.createElement("h3");
+  title.textContent = "欢迎使用 doge";
+  head.appendChild(title);
+  const skip = document.createElement("button");
+  skip.className = "ghost-btn";
+  skip.textContent = "稍后再配";
+  skip.title = "跳过向导：可用环境变量 / 本地端点，或在设置 → 密钥里随时配置";
+  skip.addEventListener("click", closeSetup);
+  head.appendChild(skip);
+  card.appendChild(head);
+  const body = document.createElement("div");
+  body.className = "setup-body";
+  card.appendChild(body);
+  box.appendChild(card);
+  if (wizardState.step === 1) renderWizardProviders(body);
+  else if (wizardState.step === 2) renderWizardKey(body);
+  else if (wizardState.step === 3) renderWizardModel(body);
+  else renderWizardDone(body);
+}
+
+// renderWizardProviders 第①步：内置 provider 宫格 + 自定义 OpenAI 兼容服务
+function renderWizardProviders(body) {
+  const step = wizardStepBar(1);
+  body.appendChild(step);
+  const hint = document.createElement("p");
+  hint.className = "muted";
+  hint.textContent = "选择模型服务商，三步完成配置即可开始对话。";
+  body.appendChild(hint);
+  const grid = document.createElement("div");
+  grid.className = "setup-providers";
+  const loading = document.createElement("div");
+  loading.className = "muted";
+  loading.textContent = "加载中…";
+  grid.appendChild(loading);
+  body.appendChild(grid);
+  loadProvidersCatalog().then((providers) => {
+    grid.textContent = "";
+    // 有 key 的排前面且默认选中（用户已备好钥匙的服务商优先）
+    const sorted = providers.slice().sort((a, b) => (b.keyConfigured ? 1 : 0) - (a.keyConfigured ? 1 : 0));
+    for (const p of sorted) {
+      if (p.id === "local") continue;
+      const btn = document.createElement("button");
+      btn.className = "setup-provider";
+      if (p.keyConfigured) {
+        const ok = document.createElement("span");
+        ok.className = "menu-badge";
+        ok.textContent = "已配密钥";
+        btn.appendChild(ok);
+      }
+      const name = document.createElement("span");
+      name.textContent = p.name || p.id;
+      btn.appendChild(name);
+      btn.addEventListener("click", () => {
+        wizardState.provider = p;
+        wizardState.custom = false;
+        wizardState.step = 2;
+        renderWizard();
+      });
+      grid.appendChild(btn);
+    }
+    const custom = document.createElement("button");
+    custom.className = "setup-provider setup-provider-custom";
+    custom.textContent = "自定义 OpenAI 兼容服务";
+    custom.title = "聚合站/自建网关：baseUrl + key + 模型 id 一次配完";
+    custom.addEventListener("click", () => {
+      wizardState.custom = true;
+      wizardState.provider = null;
+      wizardState.step = 2;
+      renderWizard();
+    });
+    grid.appendChild(custom);
+  });
+}
+
+// renderWizardKey 第②步：粘 API key（自定义路径附 baseUrl 与模型 id）
+function renderWizardKey(body) {
+  body.appendChild(wizardStepBar(2));
+  const p = wizardState.provider;
+  const name = wizardState.custom ? "自定义 OpenAI 兼容服务" : (p && (p.name || p.id)) || "";
+  const label = document.createElement("p");
+  label.textContent = wizardState.custom ? "配置自定义服务" : "粘贴 " + name + " 的 API key";
+  body.appendChild(label);
+
+  const form = document.createElement("div");
+  form.className = "setup-form";
+  if (wizardState.custom) {
+    form.appendChild(setupField("Base URL", "https://api.example.com/v1", (v) => (wizardState.baseUrl = v)));
+    form.appendChild(setupField("模型 ID", "如 deepseek-v4", (v) => (wizardState.modelId = v)));
+    const row = document.createElement("label");
+    row.className = "setup-field";
+    const span = document.createElement("span");
+    span.textContent = "API 格式";
+    const sel = document.createElement("select");
+    for (const [v, t] of [["openai-completions", "Chat Completions"], ["openai-responses", "OpenAI Responses"], ["anthropic-messages", "Anthropic Messages"]]) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = t;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener("change", () => (wizardState.apiType = sel.value));
+    row.appendChild(span);
+    row.appendChild(sel);
+    form.appendChild(row);
+  }
+  const keyField = document.createElement("label");
+  keyField.className = "setup-field";
+  const keySpan = document.createElement("span");
+  keySpan.textContent = "API key";
+  const keyInput = document.createElement("input");
+  keyInput.type = "password";
+  keyInput.placeholder = "sk-…";
+  keyInput.autocomplete = "off";
+  keyInput.addEventListener("input", () => (wizardState.key = keyInput.value.trim()));
+  keyField.appendChild(keySpan);
+  keyField.appendChild(keyInput);
+  form.appendChild(keyField);
+  body.appendChild(form);
+
+  const note = document.createElement("p");
+  note.className = "muted setup-note";
+  const authPath = (wizardState.cfg && wizardState.cfg.paths && wizardState.cfg.paths.auth) || "~/.doge/agent/auth.json";
+  if (wizardState.custom) {
+    note.textContent = "key 存入 " + authPath + "（0600，仅本机）；模型写入 models.json。";
+  } else {
+    const envs = (p && p.envKeys) || [];
+    note.textContent = "key 存入 " + authPath + "（0600，仅本机）" + (envs.length ? "；也可改用环境变量 " + envs.join(" / ") : "");
+  }
+  body.appendChild(note);
+  body.appendChild(wizardNav("下一步", () => {
+    if (wizardState.custom) {
+      if (!wizardState.baseUrl || !wizardState.modelId) {
+        note.textContent = "自定义服务需要填写 Base URL 与模型 ID。";
+        return;
+      }
+    }
+    if (!wizardState.key) {
+      note.textContent = "请先粘贴 API key（或返回上一步）。";
+      return;
+    }
+    wizardState.step = 3;
+    renderWizard();
+  }, true));
+}
+
+// renderWizardModel 第③步：该 provider 的模型单选（自定义路径自动选中刚配的模型）
+function renderWizardModel(body) {
+  body.appendChild(wizardStepBar(3));
+  const loading = document.createElement("div");
+  loading.className = "muted";
+  loading.textContent = "加载模型目录…";
+  body.appendChild(loading);
+  loadAllModelsCatalog().then((models) => {
+    body.textContent = "";
+    body.appendChild(wizardStepBar(3));
+    let candidates;
+    if (wizardState.custom) {
+      // 刚配的自定义模型第④步才写入目录，这里直接以输入值作候选
+      candidates = models.filter((m) => m.id === wizardState.modelId);
+      if (!candidates.length) {
+        candidates = [{ spec: "custom/" + wizardState.modelId, id: wizardState.modelId, name: wizardState.modelId, provider: "custom", api: wizardState.apiType }];
+      }
+    } else {
+      candidates = models.filter((m) => m.provider === wizardState.provider.id);
+    }
+    if (!candidates.length) {
+      const none = document.createElement("p");
+      none.className = "muted";
+      none.textContent = "该服务商暂无内置模型，可稍后在设置 → 模型里添加。";
+      body.appendChild(none);
+    }
+    const list = document.createElement("div");
+    list.className = "setup-models";
+    for (const m of candidates) {
+      const item = document.createElement("button");
+      item.className = "setup-model" + (wizardState.modelSpec === m.spec ? " current" : "");
+      const name = document.createElement("span");
+      name.textContent = m.id + (m.name && m.name !== m.id ? " · " + m.name : "");
+      item.appendChild(name);
+      if (m.available === false) {
+        const b = document.createElement("span");
+        b.className = "menu-badge";
+        b.textContent = "未配置密钥";
+        item.appendChild(b);
+      }
+      item.addEventListener("click", () => {
+        wizardState.modelSpec = m.spec;
+        renderWizard();
+      });
+      list.appendChild(item);
+    }
+    body.appendChild(list);
+    body.appendChild(wizardNav("完成配置", applyWizard, wizardState.modelSpec !== ""));
+  });
+}
+
+// applyWizard 第④步：写入 auth（自定义路径先写模型）→ 默认模型双写（settings
+// 管下次启动 + /api/model 管当前会话）→ 关闭向导刷新模型列表
+async function applyWizard() {
+  const w = wizardState;
+  try {
+    if (w.custom) {
+      const modelDef = {
+        id: w.modelId, name: w.modelId, api: w.apiType,
+        provider: "custom", baseUrl: w.baseUrl,
+        contextWindow: 128000, maxTokens: 8192, input: ["text"],
+      };
+      const r = await api("/api/config/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(modelDef),
+      });
+      if (!r.ok) throw new Error("保存模型失败");
+      w.modelSpec = "custom/" + w.modelId;
+    }
+    const provider = w.custom ? "custom" : w.provider.id;
+    const ar = await api("/api/config/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, key: w.key }),
+    });
+    if (!ar.ok) throw new Error("保存密钥失败");
+    if (w.modelSpec) {
+      await applyDefaultModel(w.modelSpec, false);
+      await api("/api/model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spec: w.modelSpec }),
+      }).catch(() => {});
+    }
+    w.step = 4;
+    renderWizard();
+    loadModels();
+    fetchStatus();
+  } catch (e) {
+    setStatusText("配置失败：" + (e.message || e));
+  }
+}
+
+// renderWizardDone 第④步结果卡
+function renderWizardDone(body) {
+  body.appendChild(wizardStepBar(4));
+  const ok = document.createElement("p");
+  ok.textContent = "配置完成，模型已就绪。";
+  body.appendChild(ok);
+  const spec = document.createElement("p");
+  spec.className = "muted";
+  spec.textContent = wizardState.modelSpec ? "默认模型：" + wizardState.modelSpec : "（未选默认模型，可稍后在设置 → 模型里选）";
+  body.appendChild(spec);
+  const done = document.createElement("button");
+  done.className = "primary";
+  done.textContent = "开始使用";
+  done.addEventListener("click", closeSetup);
+  body.appendChild(done);
+}
+
+// openDefaultModelBanner S2 一步式横幅：有可用模型但没设默认模型
+function openDefaultModelBanner() {
+  const box = $("#setup");
+  box.textContent = "";
+  const bar = document.createElement("div");
+  bar.className = "setup-banner";
+  const text = document.createElement("span");
+  text.textContent = "选一个默认模型，新会话将默认使用它";
+  bar.appendChild(text);
+  const sel = document.createElement("select");
+  const fill = () => {
+    sel.textContent = "";
+    loadAllModelsCatalog().then((models) => {
+      for (const m of models) {
+        if (m.available === false) continue;
+        const opt = document.createElement("option");
+        opt.value = m.spec;
+        opt.textContent = m.spec;
+        sel.appendChild(opt);
+      }
+    });
+  };
+  fill();
+  bar.appendChild(sel);
+  const apply = document.createElement("button");
+  apply.className = "primary";
+  apply.textContent = "设为默认";
+  apply.addEventListener("click", async () => {
+    if (!sel.value) return;
+    applyDefaultModel(sel.value, true).then(closeSetup).catch((e) => setStatusText(String(e.message || e)));
+  });
+  bar.appendChild(apply);
+  const close = document.createElement("button");
+  close.className = "ghost-btn";
+  close.textContent = "✕";
+  close.title = "跳过，稍后在设置 → 模型里配置";
+  close.addEventListener("click", closeSetup);
+  bar.appendChild(close);
+  box.appendChild(bar);
+  box.classList.remove("hidden");
+}
+
+// applyDefaultModel 默认模型双写：settings（下次启动）+ /api/model（当前
+// 会话立即切换），零重启零等待
+async function applyDefaultModel(spec, switchCurrent) {
+  const sr = await api("/api/config/settings", { credentials: "same-origin" });
+  if (!sr.ok) throw new Error("读取设置失败");
+  const doc = await sr.json();
+  const settings = doc.settings || {};
+  const idx = spec.indexOf("/");
+  settings.defaultProvider = spec.slice(0, idx);
+  settings.defaultModel = spec.slice(idx + 1);
+  const pr = await api("/api/config/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  if (!pr.ok) throw new Error("保存设置失败");
+  if (switchCurrent) {
+    const mr = await api("/api/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spec }),
+    });
+    if (mr.ok) {
+      state.modelSpec = spec;
+      updateModelBtn();
+    }
+  }
+  setStatusText("默认模型已保存（下次启动生效）" + (switchCurrent ? "，当前会话已切换" : ""));
+}
+
+// wizardStepBar 步骤指示条
+function wizardStepBar(cur) {
+  const bar = document.createElement("div");
+  bar.className = "setup-steps";
+  for (const [i, label] of ["选服务商", "粘贴 API key", "选默认模型", "完成"].entries()) {
+    const s = document.createElement("span");
+    s.className = "setup-step" + (i + 1 === cur ? " current" : "") + (i + 1 < cur ? " done" : "");
+    s.textContent = i + 1 + ". " + label;
+    bar.appendChild(s);
+  }
+  return bar;
+}
+
+// wizardNav 向导底部按钮行（返回/主按钮）
+function wizardNav(primaryText, onPrimary, enabled) {
+  const row = document.createElement("div");
+  row.className = "setup-nav";
+  const back = document.createElement("button");
+  back.textContent = "上一步";
+  back.addEventListener("click", () => {
+    wizardState.step--;
+    renderWizard();
+  });
+  row.appendChild(back);
+  const next = document.createElement("button");
+  next.className = "primary";
+  next.textContent = primaryText;
+  if (!enabled) next.disabled = true;
+  next.addEventListener("click", onPrimary);
+  row.appendChild(next);
+  return row;
+}
+
+// setupField 单行输入字段
+function setupField(labelText, placeholder, onInput) {
+  const field = document.createElement("label");
+  field.className = "setup-field";
+  const span = document.createElement("span");
+  span.textContent = labelText;
+  const input = document.createElement("input");
+  input.placeholder = placeholder;
+  input.spellcheck = false;
+  input.addEventListener("input", () => onInput(input.value.trim()));
+  field.appendChild(span);
+  field.appendChild(input);
+  return field;
+}
+
+// loadSettingsKeys 密钥 tab：provider 行（名称 + baseUrl + 打码 key + 更新/
+// 删除 + 可用模型数徽标）+ 添加密钥
+function loadSettingsKeys() {
+  const body = $("#settings-body");
+  const tab = state.settingsTab;
+  body.textContent = "";
+  const loading = document.createElement("div");
+  loading.className = "mesh-muted";
+  loading.textContent = "加载中…";
+  body.appendChild(loading);
+  Promise.all([
+    api("/api/config/auth", { credentials: "same-origin" }).then((r) => (r.ok ? r.json() : { providers: {} })),
+    loadProvidersCatalog(),
+    loadAllModelsCatalog(),
+  ])
+    .then(([auth, providers, models]) => {
+      if (state.settingsTab !== tab) return;
+      renderSettingsKeys(auth.providers || {}, providers, models);
+    })
+    .catch((e) => {
+      if (state.settingsTab !== tab) return;
+      body.textContent = "加载密钥失败：" + (e.message || e);
+    });
+}
+
+// renderSettingsKeys 渲染密钥面板
+function renderSettingsKeys(authProviders, providers, models) {
+  const body = $("#settings-body");
+  body.textContent = "";
+  const wrap = document.createElement("div");
+  wrap.className = "keys-panel";
+  const head = document.createElement("div");
+  head.className = "model-list-head";
+  const title = document.createElement("div");
+  title.className = "mesh-section-title";
+  title.textContent = "服务商与密钥";
+  head.appendChild(title);
+  const add = document.createElement("button");
+  add.className = "primary";
+  add.textContent = "＋ 添加密钥";
+  add.addEventListener("click", () => openKeyForm(wrap, providers, models, null));
+  head.appendChild(add);
+  wrap.appendChild(head);
+
+  const availCount = {};
+  for (const m of models) {
+    if (m.available !== false) availCount[m.provider] = (availCount[m.provider] || 0) + 1;
+  }
+  // 内置目录顺序 + auth.json 里有但目录外的自定义 provider 追加
+  const seen = new Set();
+  const rows = [];
+  for (const p of providers) {
+    seen.add(p.id);
+    rows.push(keyRow(p, authProviders[p.id], availCount[p.id] || 0, models, providers));
+  }
+  const extraIDs = Object.keys(authProviders).filter((id) => !seen.has(id)).sort();
+  for (const id of extraIDs) {
+    rows.push(keyRow({ id, name: id, requiresKey: true, envKeys: [] }, authProviders[id], availCount[id] || 0, models, providers));
+  }
+  if (!rows.length) {
+    const empty = document.createElement("div");
+    empty.className = "mesh-muted";
+    empty.textContent = "尚未配置任何密钥。";
+    wrap.appendChild(empty);
+  }
+  for (const r of rows) wrap.appendChild(r);
+  const note = document.createElement("p");
+  note.className = "muted setup-note";
+  note.textContent = "密钥存入 auth.json（0600，仅本机），保存后立即热生效；显示仅保留末 4 位。";
+  wrap.appendChild(note);
+  body.appendChild(wrap);
+}
+
+// keyRow 单个 provider 行
+function keyRow(p, authEntry, count, models, providers) {
+  const row = document.createElement("div");
+  row.className = "key-row";
+  const info = document.createElement("div");
+  info.className = "key-row-info";
+  const nameLine = document.createElement("div");
+  nameLine.className = "model-row-name";
+  const name = document.createElement("span");
+  name.textContent = p.name || p.id;
+  nameLine.appendChild(name);
+  const badges = document.createElement("span");
+  badges.className = "menu-badges";
+  const ready = !!authEntry || p.keyConfigured;
+  badges.appendChild(menuBadge(ready ? "已配置" : "未配置"));
+  if (count > 0) badges.appendChild(menuBadge(count + " 个可用模型"));
+  nameLine.appendChild(badges);
+  info.appendChild(nameLine);
+  const sub = document.createElement("div");
+  sub.className = "model-row-sub";
+  const bits = [];
+  if (p.baseUrl) bits.push(p.baseUrl);
+  if (authEntry && authEntry.maskedKey) bits.push("key " + authEntry.maskedKey);
+  if (!ready && (p.envKeys || []).length) bits.push("可用环境变量 " + p.envKeys.join(" / "));
+  sub.textContent = bits.join(" · ");
+  info.appendChild(sub);
+  row.appendChild(info);
+
+  const ops = document.createElement("div");
+  ops.className = "model-row-ops";
+  const edit = document.createElement("button");
+  edit.textContent = authEntry ? "更新" : "添加";
+  edit.addEventListener("click", () => openKeyForm(row.closest(".keys-panel"), providers, models, p));
+  ops.appendChild(edit);
+  const del = document.createElement("button");
+  del.textContent = "删除";
+  if (authEntry) {
+    del.addEventListener("click", () => {
+      if (!confirm("删除 " + (p.name || p.id) + " 的密钥？")) return;
+      del.disabled = true;
+      api("/api/config/auth/" + encodeURIComponent(p.id), { method: "DELETE" })
+        .then(async (r) => {
+          if (!r.ok) throw new Error((await r.json()).error || "删除失败");
+          setStatusText("已删除 " + p.id + " 的密钥");
+          loadSettingsKeys();
+          loadModels();
+        })
+        .catch((e) => {
+          setStatusText(String(e.message || e));
+          del.disabled = false;
+        });
+    });
+  } else {
+    del.disabled = true;
+    del.title = "未配置密钥";
+  }
+  ops.appendChild(del);
+  row.appendChild(ops);
+  return row;
+}
+
+// openKeyForm 添加/更新密钥：选内置 provider 或输入自定义名 + 粘 key
+function openKeyForm(panel, providers, models, preset) {
+  document.querySelectorAll(".key-form").forEach((f) => f.remove());
+  const form = document.createElement("div");
+  form.className = "key-form";
+  const provSel = document.createElement("select");
+  let customIdx = providers.length;
+  for (const [i, p] of providers.entries()) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = (p.name || p.id) + (p.keyConfigured ? "（已配置）" : "");
+    if (preset && preset.id === p.id) opt.selected = true;
+    provSel.appendChild(opt);
+  }
+  const customOpt = document.createElement("option");
+  customOpt.value = "__custom__";
+  customOpt.textContent = "自定义 provider…";
+  provSel.appendChild(customOpt);
+  const customName = document.createElement("input");
+  customName.placeholder = "自定义 provider 标识（如 my-gateway）";
+  customName.spellcheck = false;
+  customName.classList.add("hidden");
+  provSel.addEventListener("change", () => {
+    customName.classList.toggle("hidden", provSel.value !== "__custom__");
+  });
+  const keyInput = document.createElement("input");
+  keyInput.type = "password";
+  keyInput.placeholder = "粘贴 API key";
+  keyInput.autocomplete = "off";
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  const cancel = document.createElement("button");
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", () => form.remove());
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = "保存";
+  save.addEventListener("click", () => {
+    const provider = provSel.value === "__custom__" ? customName.value.trim() : provSel.value;
+    const key = keyInput.value.trim();
+    if (!provider) {
+      setStatusText("请选择或输入 provider");
+      return;
+    }
+    if (!key) {
+      setStatusText("请粘贴 API key");
+      return;
+    }
+    save.disabled = true;
+    api("/api/config/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, key }),
+    })
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json()).error || "保存失败");
+        form.remove();
+        setStatusText("密钥已保存并热生效：" + provider);
+        loadSettingsKeys();
+        loadModels();
+      })
+      .catch((e) => {
+        setStatusText(String(e.message || e));
+        save.disabled = false;
+      });
+  });
+  actions.appendChild(cancel);
+  actions.appendChild(save);
+  form.appendChild(provSel);
+  form.appendChild(customName);
+  form.appendChild(keyInput);
+  form.appendChild(actions);
+  panel.appendChild(form);
+}
+
+/* ---------------- 设置中心：定时任务面板 ---------------- */
+
+// loadSettingsAuto 定时 tab：任务卡片（标题/调度/下次/最近结果/启停/立即运行）
+// + 新建表单 + 历史展开
+function loadSettingsAuto() {
+  const body = $("#settings-body");
+  const tab = state.settingsTab;
+  body.textContent = "";
+  const loading = document.createElement("div");
+  loading.className = "mesh-muted";
+  loading.textContent = "加载中…";
+  body.appendChild(loading);
+  api("/api/automations", { credentials: "same-origin" })
+    .then(async (r) => {
+      if (!r.ok) throw new Error((await r.json()).error || "加载失败");
+      return r.json();
+    })
+    .then((j) => {
+      if (state.settingsTab !== tab) return;
+      renderSettingsAuto(j.automations || []);
+    })
+    .catch((e) => {
+      if (state.settingsTab !== tab) return;
+      body.textContent = "加载定时任务失败：" + (e.message || e);
+    });
+}
+
+// describeAutoSchedule 调度中文描述
+function describeAutoSchedule(sc) {
+  if (!sc) return "";
+  if (sc.kind === "delay") return (sc.delayMinutes || 0) + " 分钟后（一次性）";
+  if (sc.kind === "cron") return "cron " + sc.cron;
+  if (sc.kind === "interval") {
+    const unit = { minute: "分钟", hour: "小时", day: "天", week: "周", month: "月" }[sc.intervalUnit] || sc.intervalUnit;
+    let d = "每 " + (sc.interval || 1) + " " + unit;
+    if (sc.at) d += " " + sc.at;
+    if ((sc.weekdays || []).length) d += "（周" + sc.weekdays.join("/") + "）";
+    if ((sc.monthDays || []).length) d += "（" + sc.monthDays.join("/") + " 日）";
+    return d;
+  }
+  return "未知调度";
+}
+
+// fmtAutoTime Unix 秒的本地可读时刻
+function fmtAutoTime(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+// autoStatusBadge 状态徽标
+function autoStatusBadge(a) {
+  if (a.running) return menuBadge("运行中");
+  const map = { active: "生效", paused: "已暂停", completed: "已完成", failed: "失败" };
+  return menuBadge(map[a.status] || a.status);
+}
+
+// renderSettingsAuto 渲染面板
+function renderSettingsAuto(cards) {
+  const body = $("#settings-body");
+  body.textContent = "";
+  const wrap = document.createElement("div");
+  wrap.className = "keys-panel";
+  const head = document.createElement("div");
+  head.className = "model-list-head";
+  const title = document.createElement("div");
+  title.className = "mesh-section-title";
+  title.textContent = "定时任务" + (cards.length ? " (" + cards.length + ")" : "");
+  head.appendChild(title);
+  const add = document.createElement("button");
+  add.className = "primary";
+  add.textContent = "＋ 新建任务";
+  add.addEventListener("click", () => openAutoForm(wrap, () => loadSettingsAuto()));
+  head.appendChild(add);
+  wrap.appendChild(head);
+
+  if (!cards.length) {
+    const empty = document.createElement("div");
+    empty.className = "mesh-muted";
+    empty.textContent = "暂无定时任务。可直接在对话里说「每 20 分钟提醒我喝水」让模型创建，或点右上新建。";
+    wrap.appendChild(empty);
+  }
+  for (const c of cards) wrap.appendChild(autoCard(c, () => loadSettingsAuto()));
+  const note = document.createElement("p");
+  note.className = "muted setup-note";
+  note.textContent = "任务在常驻的 doge 进程（本控制台/桌面端/TUI）里到点自动执行；所有进程退出后不触发，错过超 5 分钟的周期跳过不补跑。";
+  wrap.appendChild(note);
+  body.appendChild(wrap);
+}
+
+// autoCard 单张任务卡片
+function autoCard(c, reload) {
+  const card = document.createElement("div");
+  card.className = "auto-card";
+  const info = document.createElement("div");
+  info.className = "key-row-info";
+  const nameLine = document.createElement("div");
+  nameLine.className = "model-row-name";
+  const name = document.createElement("span");
+  name.textContent = c.title || c.id;
+  nameLine.appendChild(name);
+  const badges = document.createElement("span");
+  badges.className = "menu-badges";
+  badges.appendChild(autoStatusBadge(c));
+  if (c.schedule && c.schedule.kind === "delay") badges.appendChild(menuBadge("一次性"));
+  if (c.maxRuns > 0) badges.appendChild(menuBadge("限 " + c.maxRuns + " 次"));
+  if (c.retry) badges.appendChild(menuBadge("重试 " + c.retry.attempts + "/5"));
+  nameLine.appendChild(badges);
+  info.appendChild(nameLine);
+  const sub = document.createElement("div");
+  sub.className = "model-row-sub";
+  const bits = [c.id, describeAutoSchedule(c.schedule), "下次 " + fmtAutoTime(c.nextRunAt), "已跑 " + (c.scheduledRunCount || 0) + " 次"];
+  if (c.model) bits.push("模型 " + c.model);
+  if (c.level && c.level !== "full") bits.push("工具级 " + c.level);
+  sub.textContent = bits.join(" · ");
+  sub.title = (c.cwd || "") + "\n" + (c.prompt || "");
+  info.appendChild(sub);
+  if (c.lastRun) {
+    const last = document.createElement("div");
+    last.className = "model-row-sub";
+    const outcomeMap = { succeeded: "成功", failed: "失败", stopped: "中止", skipped: "跳过", running: "运行中" };
+    last.textContent = "最近：" + (outcomeMap[c.lastRun.outcome] || c.lastRun.outcome) + " @ " + fmtAutoTime(c.lastRun.startedAt) +
+      (c.lastRun.error ? " · " + c.lastRun.error : "");
+    info.appendChild(last);
+  }
+  card.appendChild(info);
+
+  const ops = document.createElement("div");
+  ops.className = "model-row-ops";
+  const run = document.createElement("button");
+  run.textContent = "立即运行";
+  run.title = "手动触发一次（不占调度节奏）";
+  run.addEventListener("click", async () => {
+    run.disabled = true;
+    try {
+      const r = await api("/api/automations/" + encodeURIComponent(c.id) + "/run", { method: "POST" });
+      if (!r.ok) throw new Error((await r.json()).error || "触发失败");
+      setStatusText("已触发 " + c.id + "（后台执行）");
+      setTimeout(reload, 1500);
+    } catch (e) {
+      setStatusText(String(e.message || e));
+      run.disabled = false;
+    }
+  });
+  ops.appendChild(run);
+  const toggle = document.createElement("button");
+  const enabled = c.status === "active";
+  toggle.textContent = enabled ? "暂停" : "恢复";
+  toggle.addEventListener("click", async () => {
+    toggle.disabled = true;
+    try {
+      const r = await api("/api/automations/" + encodeURIComponent(c.id) + "/" + (enabled ? "disable" : "enable"), { method: "POST" });
+      if (!r.ok) throw new Error((await r.json()).error || "操作失败");
+      reload();
+    } catch (e) {
+      setStatusText(String(e.message || e));
+      toggle.disabled = false;
+    }
+  });
+  ops.appendChild(toggle);
+  const hist = document.createElement("button");
+  hist.textContent = "历史";
+  hist.addEventListener("click", () => toggleAutoHistory(card, c, hist));
+  ops.appendChild(hist);
+  const del = document.createElement("button");
+  del.textContent = "删除";
+  del.addEventListener("click", () => {
+    if (!confirm("删除定时任务「" + (c.title || c.id) + "」？")) return;
+    del.disabled = true;
+    api("/api/automations/" + encodeURIComponent(c.id), { method: "DELETE" })
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json()).error || "删除失败");
+        reload();
+      })
+      .catch((e) => {
+        setStatusText(String(e.message || e));
+        del.disabled = false;
+      });
+  });
+  ops.appendChild(del);
+  card.appendChild(ops);
+  return card;
+}
+
+// toggleAutoHistory 展开/收起单卡历史
+async function toggleAutoHistory(card, c, btn) {
+  const existing = card.querySelector(".auto-history");
+  if (existing) {
+    existing.remove();
+    btn.textContent = "历史";
+    return;
+  }
+  btn.textContent = "收起";
+  const box = document.createElement("div");
+  box.className = "auto-history";
+  const loading = document.createElement("div");
+  loading.className = "muted";
+  loading.textContent = "加载中…";
+  box.appendChild(loading);
+  card.appendChild(box);
+  try {
+    const r = await api("/api/automations/" + encodeURIComponent(c.id) + "/runs?limit=10", { credentials: "same-origin" });
+    if (!r.ok) throw new Error((await r.json()).error || "加载失败");
+    const j = await r.json();
+    box.textContent = "";
+    const runs = j.runs || [];
+    if (!runs.length) {
+      const none = document.createElement("div");
+      none.className = "muted";
+      none.textContent = "暂无运行记录";
+      box.appendChild(none);
+      return;
+    }
+    const outcomeMap = { succeeded: "成功", failed: "失败", stopped: "中止", skipped: "跳过", running: "运行中" };
+    for (const run of runs) {
+      const row = document.createElement("div");
+      row.className = "auto-run-row";
+      const trigger = run.trigger === "manual" ? "手动" : "定时";
+      row.textContent = fmtAutoTime(run.startedAt) + " · " + (outcomeMap[run.outcome] || run.outcome) + " · " + trigger +
+        (run.error ? " · " + run.error : "");
+      if (run.sessionId) row.title = "会话 " + run.sessionId;
+      box.appendChild(row);
+    }
+  } catch (e) {
+    box.textContent = "加载失败：" + (e.message || e);
+  }
+}
+
+// openAutoForm 新建任务表单（调度类型切换参数区）
+function openAutoForm(panel, onSaved) {
+  document.querySelectorAll(".auto-form").forEach((f) => f.remove());
+  const form = document.createElement("div");
+  form.className = "auto-form";
+  const field = (labelText, inputEl) => {
+    const f = document.createElement("label");
+    f.className = "setup-field";
+    const span = document.createElement("span");
+    span.textContent = labelText;
+    f.appendChild(span);
+    f.appendChild(inputEl);
+    form.appendChild(f);
+    return inputEl;
+  };
+  const titleInput = document.createElement("input");
+  titleInput.placeholder = "每20分钟喝水提醒（保留时间短语）";
+  field("标题", titleInput);
+  const promptInput = document.createElement("textarea");
+  promptInput.rows = 3;
+  promptInput.placeholder = "自包含指令：无人值守的新会话执行，无当前对话上下文；路径/验收标准都要写全";
+  field("Prompt", promptInput);
+
+  // 调度参数区：类型切换显示对应输入
+  const kindSel = document.createElement("select");
+  for (const [v, t] of [["interval", "固定间隔（每 N 分钟/小时/…）"], ["delay", "一次性延时（N 分钟后）"], ["cron", "cron（用户点名的墙钟时刻）"]]) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = t;
+    kindSel.appendChild(opt);
+  }
+  const kindRow = document.createElement("label");
+  kindRow.className = "setup-field";
+  const kindSpan = document.createElement("span");
+  kindSpan.textContent = "调度";
+  kindRow.appendChild(kindSpan);
+  kindRow.appendChild(kindSel);
+  form.appendChild(kindRow);
+
+  const paramBox = document.createElement("div");
+  paramBox.className = "auto-form-params";
+  form.appendChild(paramBox);
+  const fs = { kind: "interval" };
+  const renderParams = () => {
+    paramBox.textContent = "";
+    if (fs.kind === "delay") {
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.min = 1;
+      inp.placeholder = "30";
+      paramBox.appendChild(wrapParam("延迟（分钟）", inp));
+      fs.delayInput = inp;
+    } else if (fs.kind === "interval") {
+      const step = document.createElement("input");
+      step.type = "number";
+      step.min = 1;
+      step.value = 20;
+      const unit = document.createElement("select");
+      for (const [v, t] of [["minute", "分钟"], ["hour", "小时"], ["day", "天"], ["week", "周"], ["month", "月"]]) {
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = t;
+        unit.appendChild(opt);
+      }
+      const at = document.createElement("input");
+      at.placeholder = "09:00（天/周/月级可选）";
+      const row = document.createElement("div");
+      row.className = "auto-form-inline";
+      row.appendChild(wrapParam("每", step));
+      row.appendChild(wrapParam("单位", unit));
+      row.appendChild(wrapParam("时刻", at));
+      paramBox.appendChild(row);
+      fs.stepInput = step;
+      fs.unitInput = unit;
+      fs.atInput = at;
+    } else {
+      const inp = document.createElement("input");
+      inp.placeholder = "0 9 * * 1（分 时 日 月 周，本地时区）";
+      inp.spellcheck = false;
+      paramBox.appendChild(wrapParam("cron 表达式", inp));
+      fs.cronInput = inp;
+    }
+  };
+  kindSel.addEventListener("change", () => {
+    fs.kind = kindSel.value;
+    renderParams();
+  });
+  renderParams();
+
+  // 高级项（默认收起）
+  const adv = document.createElement("details");
+  adv.className = "auto-form-adv";
+  const advSum = document.createElement("summary");
+  advSum.textContent = "高级：目录 / 模型 / 工具级 / 次数上限";
+  adv.appendChild(advSum);
+  const cwdInput = document.createElement("input");
+  cwdInput.placeholder = "默认当前目录";
+  const modelSel = document.createElement("select");
+  const modelDefOpt = document.createElement("option");
+  modelDefOpt.value = "";
+  modelDefOpt.textContent = "跟随全局默认模型";
+  modelSel.appendChild(modelDefOpt);
+  loadAllModelsCatalog().then((models) => {
+    for (const m of models) {
+      if (m.available === false) continue;
+      const opt = document.createElement("option");
+      opt.value = m.spec;
+      opt.textContent = m.spec;
+      modelSel.appendChild(opt);
+    }
+  }).catch(() => {});
+  const levelSel = document.createElement("select");
+  for (const [v, t] of [["full", "full（全量工具）"], ["write", "write（无 bash）"], ["readonly", "readonly（只读）"]]) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = t;
+    levelSel.appendChild(opt);
+  }
+  const maxRunsInput = document.createElement("input");
+  maxRunsInput.type = "number";
+  maxRunsInput.min = 0;
+  maxRunsInput.placeholder = "0 = 无限";
+  const advGrid = document.createElement("div");
+  advGrid.className = "auto-form-grid";
+  advGrid.appendChild(wrapParam("工作目录", cwdInput));
+  advGrid.appendChild(wrapParam("模型", modelSel));
+  advGrid.appendChild(wrapParam("工具级", levelSel));
+  advGrid.appendChild(wrapParam("定时次数上限", maxRunsInput));
+  adv.appendChild(advGrid);
+  form.appendChild(adv);
+
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  const cancel = document.createElement("button");
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", () => form.remove());
+  const save = document.createElement("button");
+  save.className = "primary";
+  save.textContent = "创建";
+  save.addEventListener("click", async () => {
+    const title = titleInput.value.trim();
+    const prompt = promptInput.value.trim();
+    if (!title || !prompt) {
+      setStatusText("标题和 Prompt 不能为空");
+      return;
+    }
+    const schedule = { kind: fs.kind };
+    if (fs.kind === "delay") {
+      schedule.delayMinutes = parseInt(fs.delayInput.value, 10) || 0;
+    } else if (fs.kind === "interval") {
+      schedule.intervalUnit = fs.unitInput.value;
+      schedule.interval = parseInt(fs.stepInput.value, 10) || 0;
+      const at = fs.atInput.value.trim();
+      if (at) schedule.at = at;
+    } else {
+      schedule.cron = fs.cronInput.value.trim();
+    }
+    const reqBody = { title, prompt, schedule, level: levelSel.value };
+    const cwd = cwdInput.value.trim();
+    if (cwd) reqBody.cwd = cwd;
+    const model = modelSel.value;
+    if (model) reqBody.model = model;
+    const maxRuns = parseInt(maxRunsInput.value, 10) || 0;
+    if (maxRuns > 0) reqBody.maxRuns = maxRuns;
+    save.disabled = true;
+    try {
+      const r = await api("/api/automations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reqBody),
+      });
+      if (!r.ok) throw new Error((await r.json()).error || "创建失败");
+      form.remove();
+      setStatusText("定时任务已创建：" + title);
+      onSaved();
+    } catch (e) {
+      setStatusText(String(e.message || e));
+      save.disabled = false;
+    }
+  });
+  actions.appendChild(cancel);
+  actions.appendChild(save);
+  form.appendChild(actions);
+  panel.appendChild(form);
+  titleInput.focus();
+}
+
+// wrapParam 参数行的 label 包装
+function wrapParam(labelText, inputEl) {
+  const f = document.createElement("label");
+  f.className = "setup-field";
+  const span = document.createElement("span");
+  span.textContent = labelText;
+  f.appendChild(span);
+  f.appendChild(inputEl);
+  return f;
 }
 
 /* ---------------- markdown-lite ---------------- */

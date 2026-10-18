@@ -57,6 +57,9 @@ type Backend interface {
 	// ListAllModels returns the full catalog, including models that currently
 	// lack credentials (config UIs; backs /api/models?all=1).
 	ListAllModels() []ModelInfo
+	// HasUsableModel reports whether any model can actually stream (a resolved
+	// key or a keyless local endpoint) — the first-run wizard signal.
+	HasUsableModel() bool
 	SessionInfo() SessionInfo
 	ListSessions() ([]SessionSummary, error)
 
@@ -137,6 +140,10 @@ type ModelInfo struct {
 	Reasoning     bool     `json:"reasoning"`
 	Input         []string `json:"input,omitempty"`     // 支持的输入类型 text/image
 	MaxTokens     int      `json:"maxTokens,omitempty"` // 单次输出上限
+	// Available reports whether the model can stream right now (key resolved
+	// or keyless local). The active model appended as a fallback in ListModels
+	// carries false, so UIs can badge "未配置密钥" instead of pretending.
+	Available bool `json:"available"`
 }
 
 // SessionInfo describes the active session and its committed transcript.
@@ -635,11 +642,11 @@ func (b *sessionBackend) SkillsInfo() []coding.SkillInfo {
 	return b.current().SkillsInfo()
 }
 
-// SetMcpEnabled 记录本会话 MCP 启停意图（远端任务会话不可单独配置；落地
-// 时机由用户重载决定）
+// SetMcpEnabled 记录本会话 MCP 启停意图（远端任务/定时任务会话不可单独配置；
+// 落地时机由用户重载决定）
 func (b *sessionBackend) SetMcpEnabled(on bool) error {
 	cur := b.current()
-	if cur.CurrentSession().Header.Kind == "remote" {
+	if cur.CurrentSession().Header.Kind == "remote" || cur.CurrentSession().Header.Kind == "automation" {
 		return errRemoteSessionMcp
 	}
 	return cur.SetMcpEnabled(on)
@@ -660,7 +667,10 @@ func (b *sessionBackend) ListModels() []ModelInfo {
 	if cur := cur.Agent.State().Model; cur != nil {
 		spec := cur.Provider + "/" + cur.ID
 		if !seen[spec] {
-			out = append(out, modelInfo(cur))
+			// 兜底追加的当前模型实际不可用（无密钥），标记 available=false
+			info := modelInfo(cur)
+			info.Available = false
+			out = append(out, info)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Spec < out[j].Spec })
@@ -668,12 +678,26 @@ func (b *sessionBackend) ListModels() []ModelInfo {
 }
 
 func (b *sessionBackend) ListAllModels() []ModelInfo {
+	cur := b.current()
+	// 可用集合来自 AvailableModels，目录里其余模型标 available=false，
+	// 供配置 UI 显示"配好密钥即可用"的差别
+	usable := map[string]bool{}
+	for _, m := range cur.ModelRuntime.Models.AvailableModels() {
+		usable[m.Provider+"/"+m.ID] = true
+	}
 	var out []ModelInfo
-	for _, m := range b.current().ModelRuntime.Models.AllModels() {
-		out = append(out, modelInfo(m))
+	for _, m := range cur.ModelRuntime.Models.AllModels() {
+		info := modelInfo(m)
+		info.Available = usable[info.Spec]
+		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Spec < out[j].Spec })
 	return out
+}
+
+// HasUsableModel 是否存在可流式请求的模型（密钥或本地免密端点任一）
+func (b *sessionBackend) HasUsableModel() bool {
+	return len(b.current().ModelRuntime.Models.AvailableModels()) > 0
 }
 
 func modelInfo(m *ai.Model) ModelInfo {
@@ -687,6 +711,7 @@ func modelInfo(m *ai.Model) ModelInfo {
 		Reasoning:     m.Reasoning,
 		Input:         m.Input,
 		MaxTokens:     m.MaxTokens,
+		Available:     true,
 	}
 }
 

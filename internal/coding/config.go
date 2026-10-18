@@ -67,6 +67,16 @@ func UploadsDir() string {
 	return filepath.Join(AgentDir(), "uploads")
 }
 
+// AutomationsFile 定时任务定义与调度状态文件（定义+状态合一，可手工编辑）
+func AutomationsFile() string {
+	return filepath.Join(AgentDir(), "automations.json")
+}
+
+// AutomationsDir 定时任务运行台账目录（runs.jsonl 所在）
+func AutomationsDir() string {
+	return filepath.Join(AgentDir(), "automations")
+}
+
 // ModelsFile returns the user models catalog path.
 func ModelsFile() string {
 	return filepath.Join(AgentDir(), "models.json")
@@ -100,6 +110,7 @@ func EnsureAgentDir() error {
 		AgentDir(),
 		SessionsDir(),
 		UploadsDir(),
+		AutomationsDir(),
 		filepath.Join(AgentDir(), "skills"),
 		filepath.Join(AgentDir(), "prompts"),
 		LogDir(),

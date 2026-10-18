@@ -35,6 +35,16 @@ type UploadSettings struct {
 	MaxTextInlineBytes  int64 `json:"maxTextInlineBytes,omitempty"`
 }
 
+// AutomationSettings 定时任务调度配置（settings.json "automation" 节，零值取
+// automation 包默认值）。只在全局 settings 生效——定时任务自带 cwd，不随项目拆分。
+type AutomationSettings struct {
+	Enabled              bool `json:"enabled,omitempty"`
+	MaxConcurrentRuns    int  `json:"maxConcurrentRuns,omitempty"`
+	RunTimeoutMinutes    int  `json:"runTimeoutMinutes,omitempty"`
+	HistoryRetentionDays int  `json:"historyRetentionDays,omitempty"`
+	MaxAutomations       int  `json:"maxAutomations,omitempty"`
+}
+
 // Settings following the settings.json (a subset): global + project merged,
 // project wins.
 type Settings struct {
@@ -59,6 +69,8 @@ type Settings struct {
 	Web *WebSettings `json:"web,omitempty"`
 
 	Uploads *UploadSettings `json:"uploads,omitempty"`
+
+	Automation *AutomationSettings `json:"automation,omitempty"`
 }
 
 // SettingsManager loads global + project settings with deep merge (project
@@ -126,6 +138,9 @@ func mergeSettings(global, project Settings) Settings {
 	if project.Uploads != nil {
 		global.Uploads = project.Uploads
 	}
+	if project.Automation != nil {
+		global.Automation = project.Automation
+	}
 	return global
 }
 
@@ -151,6 +166,15 @@ func (s *SettingsManager) UploadsConfig() uploads.Config {
 		MaxImageInlineBytes: u.MaxImageInlineBytes,
 		MaxTextInlineBytes:  u.MaxTextInlineBytes,
 	}.WithDefaults()
+}
+
+// AutomationConfig 返回生效的定时任务设置（未配置时为 nil，由 automation
+// 包补默认值）
+func (s *SettingsManager) AutomationConfig() *AutomationSettings {
+	if s == nil {
+		return nil
+	}
+	return s.Settings.Automation
 }
 
 // Compaction returns the effective compaction settings with defaults.

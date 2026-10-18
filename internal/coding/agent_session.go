@@ -297,13 +297,13 @@ func (s *AgentSession) codeToolCaller(name string, args map[string]any) (string,
 // SetPermissionAskHandler installs the ask handler (e.g. once the TUI
 // program is running). Headless decisions stay denied without it.
 //
-// Remote-task forks refuse ask handlers: they run unattended, and their
-// permission contract is the dispatch level (readonly/write/full) plus
-// permission.json. An observer that opens the fork (e.g. the slave's web
+// Remote-task and automation forks refuse ask handlers: they run unattended,
+// and their permission contract is the dispatch level (readonly/write/full)
+// plus permission.json. An observer that opens the fork (e.g. the slave's web
 // console viewing a running remote task) must not turn asks into a block on
 // its prompt modal — that stalls the whole remote run for the ask timeout.
 func (s *AgentSession) SetPermissionAskHandler(h permissions.AskHandler) {
-	if s.Session != nil && s.Session.Header.Kind == SessionKindRemote {
+	if s.Session != nil && (s.Session.Header.Kind == SessionKindRemote || s.Session.Header.Kind == SessionKindAutomation) {
 		return
 	}
 	if s.permissions != nil {
@@ -1174,6 +1174,24 @@ func (s *AgentSession) ForkRemoteTo(sess *Session, level RemoteToolLevel, model 
 		return nil, err
 	}
 	return fork, nil
+}
+
+// ForkAutomation creates an INDEPENDENT AgentSession for a scheduled
+// automation run: a fresh session bound to cwd, marked SessionKindAutomation
+// (the UIs group these under 定时任务会话). The tool set follows the same
+// level tiers as remote tasks; the automation tool itself is NEVER included
+// (it is not part of the built-ins nor passed here), which is the physical
+// recursion guard — an unattended run cannot create more automations. Ask
+// handlers are refused (see SetPermissionAskHandler), so asks fall through to
+// the unattended autoDecide policy. The receiver is untouched and may be
+// mid-run.
+func (s *AgentSession) ForkAutomation(cwd string, model *ai.Model, level RemoteToolLevel) (*AgentSession, error) {
+	sess, err := s.SessionManager.CreateSession(cwd)
+	if err != nil {
+		return nil, err
+	}
+	sess.Header.Kind = SessionKindAutomation
+	return s.ForkRemoteTo(sess, level, model, nil)
 }
 
 // ResolveSession loads a persisted session by id, file path, or basename

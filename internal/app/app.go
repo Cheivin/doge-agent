@@ -14,6 +14,7 @@ import (
 	"doge/internal/agent"
 	"doge/internal/ai"
 	"doge/internal/coding"
+	"doge/internal/coding/automation"
 	"doge/internal/coding/uploads"
 	"doge/internal/guide"
 	"doge/internal/mcp"
@@ -45,6 +46,7 @@ type (
 		McpTrace     bool   // 追踪 MCP 请求响应
 		Mesh         bool   // 启动 P2P mesh（需 -tags mesh 构建）
 		MeshToken    string // mesh 网络令牌，覆盖 mesh.json
+		Scheduler    bool   // 启动定时任务调度器（常驻进程形态：TUI/Web/桌面；print 即退不挂）
 	}
 
 	// App 装配产物：会话与各运行时组件
@@ -57,8 +59,13 @@ type (
 		Mcp      *mcp.Manager
 		Uploads  *uploads.Store
 
-		sweepCancel context.CancelFunc
-		meshCancel  context.CancelFunc
+		// Automation 定时任务管理面（Web/桌面/CLI 共用；工具与调度器在内部
+		// 引用同一 store/runner）
+		Automation *automation.API
+
+		sweepCancel      context.CancelFunc
+		meshCancel       context.CancelFunc
+		automationCancel context.CancelFunc
 	}
 )
 
@@ -104,7 +111,9 @@ func Assemble(e *Env, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	// 解析模型
+	// 解析模型。显式 --model 解析失败照常报错退出（用户显式意图）；settings
+	// 默认模型指向已删除/改名的条目时降级到 fallback 链（models.json 第一个
+	// 自定义模型 → 内置默认），绝不因配置漂移拒绝启动
 	var model *ai.Model
 	var thinking string
 	var err error
@@ -112,7 +121,10 @@ func Assemble(e *Env, opts Options) (*App, error) {
 	case opts.Model != "":
 		model, thinking, err = runtime.ResolveModel(opts.Model)
 	case e.Settings.Settings.DefaultProvider != "" && e.Settings.Settings.DefaultModel != "":
-		model, thinking, err = runtime.ResolveModel(e.Settings.Settings.DefaultProvider + "/" + e.Settings.Settings.DefaultModel)
+		model, _ = runtime.ResolveDefaultWithFallback(e.Settings.Settings.DefaultProvider, e.Settings.Settings.DefaultModel)
+		if model == nil {
+			return nil, errors.New("no models available")
+		}
 	default:
 		model, thinking, err = runtime.DefaultModel()
 	}
@@ -185,6 +197,15 @@ func Assemble(e *Env, opts Options) (*App, error) {
 		meshNode, meshCancel, meshTools = startMesh(opts, skills, model, uploadStore)
 	}
 
+	// Automation：定时任务存储 + automation 工具（无任务文件时工具仍注册——
+	// list 返回空、create 可用，功能可发现性优先）。执行器绑定会话后经 deps
+	// 指针回填（工具闭包执行期才读）；调度器只在常驻进程形态挂载（print 即
+	// 退不挂），settings.automation.enabled=false 可整体停用
+	autoCfg := automation.ConfigFromSettings(e.Settings.AutomationConfig())
+	autoStore := automation.NewStore(coding.AutomationsFile(), autoCfg)
+	autoDeps := &automation.ToolDeps{Store: autoStore}
+	autoSettings := e.Settings.Settings.Automation
+
 	sess, err := coding.NewAgentSession(coding.AgentSessionOptions{
 		Cwd:             e.Cwd,
 		Model:           model,
@@ -199,8 +220,9 @@ func Assemble(e *Env, opts Options) (*App, error) {
 		SkillsDirs:      skillDirs,
 		PromptTemplates: templates,
 		// 内置 guide 工具：用法/配置/功能问题按模块查询内置指南（恒可用，
-		// 独立部署无仓库文档也能答）；mesh 工具随构建与会话注入
-		ExtraTools: append([]*agent.AgentTool{guide.Tool()}, meshTools...),
+		// 独立部署无仓库文档也能答）；mesh 工具随构建与会话注入；automation
+		// 工具恒注册（调度器不开也能 create/list，跑不跑由常驻进程决定）
+		ExtraTools: append([]*agent.AgentTool{guide.Tool(), automation.Tool(autoDeps)}, meshTools...),
 	})
 	if err != nil {
 		closeMesh(meshNode, meshCancel)
@@ -228,24 +250,43 @@ func Assemble(e *Env, opts Options) (*App, error) {
 	}
 	sess.SetMcpTools(mcpMgr.BuildTools())
 
+	// 定时任务：执行器绑定共享会话（fork 模板 + 回注目标），调度器随
+	// opts.Scheduler 挂载（常驻形态），cancel 收口进 App；管理面恒装配
+	// （Web/桌面/CLI 入口共用，print 模式也可用）
+	autoDeps.Runner = automation.NewRunner(autoStore, sess, coding.AutomationsDir(), autoCfg)
+	autoDeps.Session = sess
+	autoAPI := automation.NewAPI(autoStore, autoDeps.Runner)
+	var automationCancel context.CancelFunc
+	if opts.Scheduler && (autoSettings == nil || autoSettings.Enabled) {
+		autoCtx, cancel := context.WithCancel(context.Background())
+		automationCancel = cancel
+		automation.NewScheduler(autoStore, autoDeps.Runner).Start(autoCtx)
+	}
+
 	return &App{
-		Settings:    e.Settings,
-		Runtime:     runtime,
-		Session:     sess,
-		MeshNode:    meshNode,
-		MeshView:    meshView,
-		Mcp:         mcpMgr,
-		Uploads:     uploadStore,
-		sweepCancel: sweepCancel,
-		meshCancel:  meshCancel,
+		Settings:         e.Settings,
+		Runtime:          runtime,
+		Session:          sess,
+		MeshNode:         meshNode,
+		MeshView:         meshView,
+		Mcp:              mcpMgr,
+		Uploads:          uploadStore,
+		Automation:       autoAPI,
+		sweepCancel:      sweepCancel,
+		meshCancel:       meshCancel,
+		automationCancel: automationCancel,
 	}, nil
 }
 
-// Close 收尾：停 mesh、关 MCP、停上传清理，幂等
+// Close 收尾：停 mesh、停定时任务调度、关 MCP、停上传清理，幂等
 func (a *App) Close() {
 	closeMesh(a.MeshNode, a.meshCancel)
 	a.meshCancel = nil
 	a.MeshNode = nil
+	if a.automationCancel != nil {
+		a.automationCancel()
+		a.automationCancel = nil
+	}
 	if a.sweepCancel != nil {
 		a.sweepCancel()
 		a.sweepCancel = nil

@@ -319,9 +319,21 @@ agent 配置总览：版本、目录布局与生效配置。响应：
     "meshConfig":      "/Users/me/.doge/agent/mesh.json",
     "uploads":         "/Users/me/.doge/agent/uploads"
   },
-  "settings": { ...生效 Settings（全局+项目合并，项目优先）... }
+  "settings": { ...生效 Settings（全局+项目合并，项目优先）... },
+  "setup": {
+    "ready": true,
+    "hasUsableModel": true,
+    "hasDefaultModel": true
+  }
 }
 ```
+
+`setup` 是首跑配置信号：`hasUsableModel` = 存在可流式请求的模型（auth.json
+密钥或环境变量或本地端点任一），`hasDefaultModel` = settings 同时设了
+defaultProvider + defaultModel，`ready` = 两者齐备。就绪与否永远从真实状态
+推导（无哨兵文件）：清掉配置或换机器自然重现引导。客户端据此决定形态——
+`!hasUsableModel` 出首跑向导；`hasUsableModel && !hasDefaultModel` 出一步式
+"选默认模型"横幅。
 
 #### GET /api/config/settings
 
@@ -360,6 +372,25 @@ compaction/theme/shellPath/streamIdleSeconds/logLevel/web 等）。
 #### DELETE /api/config/auth/{provider}
 
 删除一个提供商 key 并刷新运行时。响应：`200 {"ok":true,"reloaded":true}`。
+
+#### GET /api/config/providers
+
+内置 provider 目录 + 各自密钥就绪状态（首跑向导与密钥面板的数据源；写密钥
+走 `POST /api/config/auth`）：
+
+```json
+{
+  "providers": [
+    { "id": "openai", "name": "OpenAI", "baseUrl": "https://api.openai.com/v1",
+      "requiresKey": true, "envKeys": ["OPENAI_API_KEY"], "keyConfigured": false },
+    { "id": "local", "name": "Local", "requiresKey": false, "keyConfigured": true }
+  ]
+}
+```
+
+`envKeys` 供向导展示"也可用环境变量 XXX"；`keyConfigured` = auth.json 有 key
+或环境变量已设（免密端点恒 true）。models.json 里出现过的自定义 provider
+也会追加在列表尾部。
 
 #### GET /api/logs
 
@@ -693,6 +724,66 @@ apply。未知 kind → `400`。
 | 其余（大二进制/超限图片/模型不支持图片） | 引用行 `text` 块：`[附件 i/n] <绝对路径> size=… mime=… sha256=… 可用 read 工具读取`，agent 按需用 `read`/`bash` 处理 |
 
 转录中该用户消息的 `content` 为数组形态（§5.6/§5.7）：text 块 + image 块。
+
+### 4.14 定时任务（automations，v6 新增）
+
+设置中心「定时任务」tab 的数据面；管理面未装配时所有端点 `503`。
+
+#### GET /api/automations
+
+任务卡片列表（每张含最近一次 run）：
+
+```json
+{ "automations": [ { "id": "auto-…", "title": "每20分钟喝水提醒", "prompt": "…",
+    "cwd": "/path", "level": "full", "recurring": true, "status": "active",
+    "enabled": true, "nextRunAt": 1792200000, "scheduledRunCount": 3,
+    "lastRun": { "id": "auto-…:1792198800", "outcome": "succeeded",
+                 "startedAt": 1792198810, "session": "…" } } ] }
+```
+
+#### POST /api/automations
+
+创建。body 即任务文档（`title`/`prompt`/`schedule` 必填；`cwd` 缺省取服务进程
+当前目录，来源会话记为共享会话——run 结束结果卡片回注到它）：
+
+```json
+{ "title": "每20分钟喝水提醒", "prompt": "提醒喝水",
+  "schedule": { "kind": "interval", "intervalUnit": "minute", "interval": 20 } }
+```
+
+调度三选一：`{"kind":"delay","delayMinutes":N}`、`{"kind":"interval","intervalUnit":
+"minute|hour|day|week|month","interval":N,"at":"HH:MM","weekdays":[],"monthDays":[]}`、
+`{"kind":"cron","cron":"0 9 * * 1"}`（本地时区）。校验失败 `400`。
+
+#### GET /api/automations/{id}
+
+单条详情 + 最近 run（`?runs=N` 控制条数，默认 5）：`{"automation": {...}, "runs": [...]}`。
+
+#### PATCH /api/automations/{id}
+
+部分更新：body 里出现的字段才改（`title`/`prompt`/`cwd`/`model`/`level`/
+`maxRuns`，`schedule` 整体替换），未出现保持不变。调度变更即重锚（从当前时刻
+重新推导下次触发）。响应 `{"automation": {...}}`；`400`（校验失败/运行中）。
+
+#### DELETE /api/automations/{id}
+
+删除任务。`200 {"ok":true}`；`404`。
+
+#### POST /api/automations/{id}/run
+
+手动立即触发（异步执行，不占调度节奏、不动 nextRunAt/计数）：
+`200 {"ok":true,"runId":"…"}`；`400`（运行中/并发满）。
+
+#### POST /api/automations/{id}/enable · /disable
+
+恢复（仅 paused 可）/ 暂停（仅 active 可）。响应 `{"automation": {...}}`；`400`。
+
+#### GET /api/automations/{id}/runs
+
+运行台账（`?limit=N`，默认 10，新→旧）：`{"runs": [...]}`。行结构 `{id,
+automationId, trigger: "schedule"|"manual", scheduledAt, startedAt, finishedAt,
+outcome: "running"|"succeeded"|"failed"|"stopped"|"skipped", session, summary,
+error}`——完整转录即该 session 的会话 JSONL，台账只存摘要。
 
 ## 5. 数据模型
 

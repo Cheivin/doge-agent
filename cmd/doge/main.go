@@ -84,6 +84,11 @@ func main() {
 		os.Exit(runMeshCommand(opts.args[1:]))
 	}
 
+	// automation 子命令：doge automation list|add|rm|enable|run ...
+	if len(opts.args) > 0 && opts.args[0] == "automation" {
+		os.Exit(runAutomationCommand(opts.args[1:]))
+	}
+
 	// 非交互模式：stdout 非 TTY 或指定 -p
 	mode := coding.PrintModeText
 	if opts.mode == "json" {
@@ -150,6 +155,7 @@ func main() {
 	}
 
 	// 装配：模型运行时、会话、技能、上传暂存区、mesh、MCP
+	// 定时任务调度器只在常驻形态挂载（TUI/Web）；print/export 即退不挂
 	a, err := app.Assemble(env, app.Options{
 		Version:      versionString(),
 		Model:        opts.model,
@@ -165,6 +171,7 @@ func main() {
 		McpTrace:     opts.mcpTrace,
 		Mesh:         opts.mesh,
 		MeshToken:    opts.meshToken,
+		Scheduler:    interactive || webEnabled,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "doge: %v\n", err)
@@ -252,6 +259,11 @@ Mesh subcommands (see 'doge mesh --help'):
   doge mesh peers          list connected nodes
   doge mesh forward ...    manage port forwarding rules
 
+Automation subcommands (see 'doge automation help'):
+  doge automation list     list scheduled automations
+  doge automation add ...  create one (--every 20m | --delay-minutes 120 | --cron "0 9 * * 1")
+  doge automation run <id> trigger a manual run now
+
 Interactive mode is started when stdin is a TTY.
 Web console requires the access token shown on startup (or a file
 ~/.doge/agent/web-token). Web host/port/token can be set in
@@ -337,13 +349,23 @@ func listModels() {
 		fmt.Fprintf(os.Stderr, "doge: %v\n", err)
 		os.Exit(1)
 	}
+	// 名实相符：--list-models 只列当前真正可用的模型（密钥或本地端点任一），
+	// 不可用的目录条目计数提示，引导用户配 key 而不是误导"都能跑"
+	available := runtime.Models.AvailableModels()
+	if len(available) == 0 {
+		fmt.Println("No usable models: add an API key (settings → keys, auth.json, or provider env vars) and retry.")
+		return
+	}
 	fmt.Println("Available models:")
-	for _, m := range runtime.Models.AllModels() {
+	for _, m := range available {
 		label := m.Name
 		if label == "" {
 			label = m.ID
 		}
 		fmt.Printf("  %s/%s  (%s, %s)\n", m.Provider, m.ID, label, m.API)
+	}
+	if hidden := len(runtime.Models.AllModels()) - len(available); hidden > 0 {
+		fmt.Printf("\n(%d catalog models hidden: no API key resolved)\n", hidden)
 	}
 }
 
@@ -357,5 +379,5 @@ func isTTY(f *os.File) bool {
 
 // runInteractive 启动 bubbletea 交互模式
 func runInteractive(a *app.App, initialMessage string) {
-	ui.Run(a.Session, a.MeshView, a.Mcp, version, initialMessage)
+	ui.Run(a.Session, a.MeshView, a.Mcp, a.Automation, version, initialMessage)
 }

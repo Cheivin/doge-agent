@@ -34,6 +34,14 @@ var defaultEnvKeys = map[string][]string{
 	"local":      {},
 }
 
+// EnvKeysFor returns the environment variables that may hold a key for the
+// provider, falling back to the conventional <PROVIDER>_API_KEY name. It is
+// the exported view of defaultEnvKeys for config UIs and the builtin provider
+// catalog.
+func EnvKeysFor(provider string) []string {
+	return envKeysFor(provider)
+}
+
 // envKeysFor returns the environment variables that may hold a key for the
 // provider, falling back to the conventional <PROVIDER>_API_KEY name.
 func envKeysFor(provider string) []string {
@@ -67,13 +75,16 @@ func ResolveAPIKey(model *Model, opts *StreamOptions, store CredentialStore) str
 }
 
 // MissingAPIKeyError builds the guidance message shown when no key is found.
+// The message is shared by all three UIs (TUI/Web/desktop): it points to the
+// settings → keys panel, the provider's env vars, and the auth.json path, so
+// a first-run user knows every way out without reading docs.
 func MissingAPIKeyError(model *Model) error {
 	envs := envKeysFor(model.Provider)
 	if len(envs) == 0 {
-		return fmt.Errorf("no API key found for provider %q", model.Provider)
+		return fmt.Errorf("no API key for provider %q. 在设置 → 密钥中添加，或将密钥写入 ~/.doge/agent/auth.json", model.Provider)
 	}
 	return fmt.Errorf(
-		"no API key found for provider %q. Set the %s environment variable or pass an API key with --api-key.",
-		model.Provider, strings.Join(envs, " or "),
+		"no API key for provider %q. 在设置 → 密钥中添加，或设置环境变量 %s，或将密钥写入 ~/.doge/agent/auth.json",
+		model.Provider, strings.Join(envs, " 或 "),
 	)
 }

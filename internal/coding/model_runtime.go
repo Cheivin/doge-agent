@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"doge/internal/ai"
+	"doge/pkg/logx"
 )
 
 // ModelRuntime wires the model catalog, credential store, and streaming
@@ -12,6 +13,10 @@ import (
 type ModelRuntime struct {
 	Models *ai.Models
 	Auth   *AuthStore
+
+	// customFirst 是 models.json 里的第一个自定义模型（用户显式配置的第一个，
+	// 默认模型 fallback 链的第二优先级）；AddCustomModels/Reload 时更新
+	customFirst *ai.Model
 }
 
 // NewModelRuntime builds the runtime from the catalog and auth store.
@@ -33,6 +38,9 @@ func (r *ModelRuntime) AddCustomModels(modelsFile string) error {
 	for _, m := range custom {
 		r.Models.AddModel(m)
 	}
+	if len(custom) > 0 && custom[0] != nil {
+		r.customFirst = custom[0]
+	}
 	return nil
 }
 
@@ -51,6 +59,10 @@ func (r *ModelRuntime) Reload(modelsFile string) error {
 	}
 	for _, m := range custom {
 		r.Models.AddModel(m)
+	}
+	r.customFirst = nil
+	if len(custom) > 0 && custom[0] != nil {
+		r.customFirst = custom[0]
 	}
 	return nil
 }
@@ -84,9 +96,18 @@ func (r *ModelRuntime) ResolveModel(spec string) (*ai.Model, string, error) {
 	return nil, "", fmt.Errorf("unknown model %q. Use provider/model syntax (e.g. openai/gpt-5.2)", spec)
 }
 
-// DefaultModel returns the settings default or the first catalog model.
+// DefaultModel returns the default model with a fallback chain: the first
+// custom model from models.json (the user's own configuration), then the
+// builtin openai/gpt-5.2, then the first catalog entry. Callers wanting the
+// settings default resolve it themselves and fall back here when it no longer
+// exists (renamed/deleted models.json entry).
 func (r *ModelRuntime) DefaultModel() (*ai.Model, string, error) {
-	// Fall back to openai/gpt-5.2 (a sensible default).
+	// 用户配置的第一个自定义模型优先
+	if r.customFirst != nil {
+		if m, ok := r.Models.GetModel(r.customFirst.Provider, r.customFirst.ID); ok {
+			return m, "", nil
+		}
+	}
 	model, ok := r.Models.GetModel("openai", "gpt-5.2")
 	if !ok {
 		models := r.Models.AllModels()
@@ -96,4 +117,20 @@ func (r *ModelRuntime) DefaultModel() (*ai.Model, string, error) {
 		return models[0], "", nil
 	}
 	return model, "", nil
+}
+
+// ResolveDefaultWithFallback 解析 settings 默认模型；配置指向的模型已不存在
+// （改名/删除）时降级到 DefaultModel 并记日志，绝不因配置漂移拒绝启动。
+func (r *ModelRuntime) ResolveDefaultWithFallback(defaultProvider, defaultModel string) (*ai.Model, string) {
+	if defaultProvider != "" && defaultModel != "" {
+		if m, _, err := r.ResolveModel(defaultProvider + "/" + defaultModel); err == nil {
+			return m, ""
+		}
+		logx.Warnf("[runtime] settings 默认模型 %s/%s 不存在，回退到可用目录的第一个", defaultProvider, defaultModel)
+	}
+	m, _, err := r.DefaultModel()
+	if err != nil {
+		return nil, ""
+	}
+	return m, ""
 }
