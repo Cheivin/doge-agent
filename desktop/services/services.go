@@ -11,6 +11,7 @@ import (
 	"doge/internal/app"
 	"doge/internal/coding"
 	"doge/internal/coding/uploads"
+	"doge/internal/console"
 	"doge/internal/web"
 )
 
@@ -68,6 +69,14 @@ func errUnavailable(msg string) *ApiError {
 }
 func errInternal(err error) *ApiError {
 	return &ApiError{Kind: "error", Message: err.Error()}
+}
+
+// consoleErr 把 console 的传输无关错误转成 ApiError（kind 值一一对应）
+func consoleErr(e *console.Error) error {
+	if e == nil {
+		return nil
+	}
+	return &ApiError{Kind: string(e.Kind), Message: e.Message}
 }
 
 // New 装配全部服务

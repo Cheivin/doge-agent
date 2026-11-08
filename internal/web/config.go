@@ -6,12 +6,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
 	"doge/internal/ai"
 	"doge/internal/coding"
+	"doge/internal/console"
 	"doge/pkg/logx"
 )
 
@@ -19,10 +19,6 @@ const (
 	defaultLogLines = 200
 	maxLogLines     = 5000
 )
-
-// logDateRe bounds the ?date= archive selector (doge.log.<YYYY-MM-DD>[.N]);
-// anything else would turn the parameter into arbitrary path access.
-var logDateRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(\.\d+)?$`)
 
 // handleConfigOverview reports where the agent's files live and what the
 // effective settings are — a management client's entry point, so it can render
@@ -608,42 +604,10 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			lines = n
 		}
 	}
-	if lines > maxLogLines {
-		lines = maxLogLines
-	}
-	path := coding.LogFile()
-	if date := r.URL.Query().Get("date"); date != "" {
-		if !logDateRe.MatchString(date) {
-			writeError(w, http.StatusBadRequest, "invalid date (want YYYY-MM-DD)")
-			return
-		}
-		path += "." + date
-	}
-	tail, err := tailFile(path, lines)
-	if err != nil {
-		if os.IsNotExist(err) {
-			writeError(w, http.StatusNotFound, "log file not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+	result, e := console.Logs(lines, r.URL.Query().Get("date"))
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"file": path, "lines": tail})
-}
-
-// tailFile returns the last n lines. Log files are bounded by rotation
-// (10MB), so reading the whole file is fine at these sizes.
-func tailFile(path string, n int) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	if len(lines) == 1 && lines[0] == "" {
-		return nil, nil
-	}
-	return lines, nil
+	writeJSON(w, http.StatusOK, result)
 }

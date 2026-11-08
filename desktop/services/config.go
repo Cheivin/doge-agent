@@ -4,24 +4,17 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	"doge/internal/ai"
 	"doge/internal/coding"
+	"doge/internal/console"
 	"doge/internal/coding/permissions"
 	"doge/internal/web"
 	"doge/pkg/logx"
 )
 
-const (
-	defaultLogLines = 200
-	maxLogLines     = 5000
-)
-
-// logDateRe 约束日志归档选择（doge.log.<YYYY-MM-DD>[.N]），防止参数变任意路径访问
-var logDateRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(\.\d+)?$`)
 
 type (
 	// ConfigService 配置与诊断（对应 /api/config*、/api/reload、/api/logs）
@@ -392,27 +385,11 @@ func (s *ConfigService) Reload() (map[string]any, error) {
 
 // Logs 诊断日志尾部；date 读归档（YYYY-MM-DD[.N]）
 func (s *ConfigService) Logs(lines int, date string) (map[string]any, error) {
-	if lines <= 0 {
-		lines = defaultLogLines
+	result, e := console.Logs(lines, date)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	if lines > maxLogLines {
-		lines = maxLogLines
-	}
-	path := coding.LogFile()
-	if date != "" {
-		if !logDateRe.MatchString(date) {
-			return nil, errInvalid("invalid date (want YYYY-MM-DD)")
-		}
-		path += "." + date
-	}
-	tail, err := tailFile(path, lines)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, errNotFound("log file not found")
-		}
-		return nil, errInternal(err)
-	}
-	return map[string]any{"file": path, "lines": tail}, nil
+	return result, nil
 }
 
 // reloadAnswer 配置写盘后热重载并作答；重载失败不影响已写入的文件。
@@ -479,22 +456,6 @@ func maskKey(key string) string {
 		return "****"
 	}
 	return "…" + key[len(key)-4:]
-}
-
-// tailFile 返回最后 n 行
-func tailFile(path string, n int) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	if len(lines) == 1 && lines[0] == "" {
-		return nil, nil
-	}
-	return lines, nil
 }
 
 // PermissionsGet 读权限策略（permissions.json；不存在返回空策略）

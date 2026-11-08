@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"doge/internal/coding"
 	"doge/internal/coding/permissions"
+	"doge/internal/console"
 )
 
 // handleLogin validates the presented token and issues a session cookie.
@@ -227,46 +226,15 @@ func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
-// FsDir 目录选择器用的目录项
-type FsDir struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-}
-
 // handleFsList 列出指定目录下的子目录（新建会话的目录选择器数据源），
 // path 为空时从用户主目录开始；隐藏目录（.开头）不展示。
 func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		path = home
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	result, e := console.ListDirs(r.URL.Query().Get("path"))
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	entries, err := os.ReadDir(abs)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	dirs := []FsDir{}
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
-		dirs = append(dirs, FsDir{Name: e.Name(), Path: filepath.Join(abs, e.Name())})
-	}
-	parent := filepath.Dir(abs)
-	if parent == abs {
-		parent = "" // 已到根
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"path": abs, "parent": parent, "dirs": dirs})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleSessionNew starts a fresh session and resets this window's view only.
