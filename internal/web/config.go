@@ -226,12 +226,37 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := os.WriteFile(coding.SettingsFile(), append(data, '\n'), 0o600); err != nil {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	// 原子落盘：中途崩溃不留截断的 settings.json
+	if err := writeFileAtomic(coding.SettingsFile(), append(data, '\n'), 0o600); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	logx.Infof("[web] settings.json rewritten via API")
+	s.clearProjectDefaultIfStale(cfg.DefaultProvider, cfg.DefaultModel)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restartRequired": true})
+}
+
+// clearProjectDefaultIfStale 项目 settings 持有默认模型且与请求体的默认不同
+// 时，清掉项目层旧默认：合并时 project wins，只写全局不生效——UI 改默认
+// 显示已保存但实际仍是旧值即来源于此。清场后默认模型的决定权归全局。
+func (s *Server) clearProjectDefaultIfStale(provider, model string) {
+	path := coding.ProjectSettingsFile(s.defaultBackend.Status().Cwd)
+	st, err := coding.ReadSettingsFile(path)
+	if err != nil || st.DefaultProvider == "" {
+		return
+	}
+	if st.DefaultProvider == provider && st.DefaultModel == model {
+		return
+	}
+	st.DefaultProvider = ""
+	st.DefaultModel = ""
+	if err := coding.SaveSettings(path, st); err != nil {
+		logx.Warnf("[web] clear project default: %v", err)
+		return
+	}
+	logx.Infof("[web] project-level stale default cleared: %s", path)
 }
 
 // authEntry mirrors one auth.json record ({"type":"api_key","key":"..."}).
@@ -272,6 +297,9 @@ func (s *Server) handleAuthSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "provider required")
 		return
 	}
+	// 锁覆盖读-改-写与 reload：并发写 auth.json 丢更新、或 reload 读到旧文件
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	store := coding.LoadAuthStore(coding.AuthFile())
 	var err error
 	if strings.TrimSpace(req.Key) == "" {
@@ -295,6 +323,8 @@ func (s *Server) handleAuthDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "provider required")
 		return
 	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	if err := coding.LoadAuthStore(coding.AuthFile()).DeleteAPIKey(provider); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -308,12 +338,44 @@ func (s *Server) handleAuthDelete(w http.ResponseWriter, r *http.Request) {
 // (the response carries the error; POST /api/reload can retry).
 func (s *Server) answerAfterConfigWrite(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"ok": true, "reloaded": true}
-	if err := s.backendFor(r).ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(s.backendFor(r)); err != nil {
 		logx.Warnf("[web] reload after config write: %v", err)
 		resp["reloaded"] = false
 		resp["error"] = err.Error()
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// reloadAfterConfigWrite 配置写盘后的全局重载：请求窗口会话先走 Backend 接口
+// 重载（兼容测试桩），再补齐 TUI 共享会话与控制表全部活跃会话（各窗口分叉、
+// 远端/定时任务 fork），按实例去重。只重载请求窗口的会话时，其余会话仍持旧
+// 模型定义——「改了配置没生效」即来源于此。
+func (s *Server) reloadAfterConfigWrite(b Backend) error {
+	if err := b.ReloadConfig(); err != nil {
+		return err
+	}
+	seen := map[*coding.AgentSession]bool{}
+	if sb, ok := b.(*sessionBackend); ok {
+		seen[sb.currentAgent()] = true
+	}
+	if s.shared != nil {
+		seen[s.shared] = true
+	}
+	if s.ctrl != nil {
+		for _, sess := range s.ctrl.actives() {
+			seen[sess] = true
+		}
+	}
+	var firstErr error
+	for sess := range seen {
+		if sess == nil {
+			continue
+		}
+		if err := sess.ReloadConfig(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // readAuthKeys parses auth.json into provider → key (a missing file is an
@@ -385,6 +447,9 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 			prevProvider, prevID = v[:idx], v[idx+1:]
 		}
 	}
+	// 锁覆盖 Load→改→Save→重定向默认：并发 upsert 丢更新（后写覆盖先写）
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	path := coding.ModelsFile()
 	custom, err := coding.LoadCustomModels(path)
 	if err != nil {
@@ -394,7 +459,8 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 	replaced := false
 	for i, c := range custom {
 		if c.Provider == m.Provider && c.ID == m.ID {
-			custom[i] = &m
+			// 命中既有条目：扩展字段（headers 等高级配置）回填旧值，编辑不丢配置
+			custom[i] = coding.MergeModelEdit(c, &m)
 			replaced = true
 			break
 		}
@@ -403,7 +469,7 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 	if !replaced && prevProvider != "" {
 		for i, c := range custom {
 			if c.Provider == prevProvider && c.ID == prevID {
-				custom[i] = &m
+				custom[i] = coding.MergeModelEdit(c, &m)
 				replaced = true
 				renameHit = true
 				break
@@ -419,7 +485,7 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 	}
 	logx.Infof("[web] models.json updated via API (%s/%s)", m.Provider, m.ID)
 	resp := map[string]any{"ok": true, "reloaded": true}
-	if err := s.backendFor(r).ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(s.backendFor(r)); err != nil {
 		logx.Warnf("[web] reload after config write: %v", err)
 		resp["reloaded"] = false
 		resp["error"] = err.Error()
@@ -440,32 +506,38 @@ func (s *Server) handleConfigModelsUpsert(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// syncSettingsDefault 模型改名/删除后同步全局 settings.json 的默认模型指向。
-// 默认未设置或指向别的模型时不动；写失败仅记日志（下次启动还有 fallback 链）。
+// syncSettingsDefault 模型改名/删除后同步默认模型指向。全局与项目两个
+// settings 文件逐个检查：哪个文件持有旧指向就改哪个。按合并视图判断会把
+// 项目层默认误写进全局——项目旧值仍在且合并时 project wins，同步无效
+// （默认配置不跟着调整即来源于此）。newSpec 为空 = 清除，启动 fallback
+// 链接管；写失败仅记日志。
 func (s *Server) syncSettingsDefault(oldSpec, newSpec string) {
-	cwd := s.defaultBackend.Status().Cwd
-	settings, err := coding.LoadSettings(coding.SettingsFile(), coding.ProjectSettingsFile(cwd))
-	if err != nil {
-		logx.Warnf("[web] sync settings default: %v", err)
-		return
+	for _, path := range []string{
+		coding.SettingsFile(),
+		coding.ProjectSettingsFile(s.defaultBackend.Status().Cwd),
+	} {
+		st, err := coding.ReadSettingsFile(path)
+		if err != nil {
+			logx.Warnf("[web] sync settings default: %v", err)
+			continue
+		}
+		if st.DefaultProvider == "" || st.DefaultProvider+"/"+st.DefaultModel != oldSpec {
+			continue
+		}
+		if newSpec != "" {
+			idx := strings.Index(newSpec, "/")
+			st.DefaultProvider = newSpec[:idx]
+			st.DefaultModel = newSpec[idx+1:]
+		} else {
+			st.DefaultProvider = ""
+			st.DefaultModel = ""
+		}
+		if err := coding.SaveSettings(path, st); err != nil {
+			logx.Warnf("[web] sync settings default: %v", err)
+			continue
+		}
+		logx.Infof("[web] settings default model re-pointed in %s: %s -> %s", path, oldSpec, newSpec)
 	}
-	cur := settings.Settings.DefaultProvider + "/" + settings.Settings.DefaultModel
-	if settings.Settings.DefaultProvider == "" || cur != oldSpec {
-		return
-	}
-	if newSpec != "" {
-		idx := strings.Index(newSpec, "/")
-		settings.Settings.DefaultProvider = newSpec[:idx]
-		settings.Settings.DefaultModel = newSpec[idx+1:]
-	} else {
-		settings.Settings.DefaultProvider = ""
-		settings.Settings.DefaultModel = ""
-	}
-	if err := coding.SaveSettings(coding.SettingsFile(), settings.Settings); err != nil {
-		logx.Warnf("[web] sync settings default: %v", err)
-		return
-	}
-	logx.Infof("[web] settings default model re-pointed: %s -> %s", oldSpec, newSpec)
 }
 
 // handleConfigModelsDelete removes one custom model from models.json and hot-
@@ -473,6 +545,8 @@ func (s *Server) syncSettingsDefault(oldSpec, newSpec string) {
 // deleted here.
 func (s *Server) handleConfigModelsDelete(w http.ResponseWriter, r *http.Request) {
 	provider, id := r.PathValue("provider"), r.PathValue("id")
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	path := coding.ModelsFile()
 	custom, err := coding.LoadCustomModels(path)
 	if err != nil {
@@ -498,7 +572,7 @@ func (s *Server) handleConfigModelsDelete(w http.ResponseWriter, r *http.Request
 	}
 	logx.Infof("[web] models.json updated via API (removed %s/%s)", provider, id)
 	resp := map[string]any{"ok": true, "reloaded": true}
-	if err := s.backendFor(r).ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(s.backendFor(r)); err != nil {
 		logx.Warnf("[web] reload after config write: %v", err)
 		resp["reloaded"] = false
 		resp["error"] = err.Error()

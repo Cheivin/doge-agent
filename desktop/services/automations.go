@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 
 	"doge/internal/coding/automation"
 )
@@ -65,6 +66,9 @@ func (s *AutomationsService) Get(id string, runs int) (map[string]any, error) {
 		runs = 5
 	}
 	history, _ := v.History(id, runs)
+	if history == nil {
+		history = []*automation.Run{}
+	}
 	return map[string]any{"automation": a, "runs": history}, nil
 }
 
@@ -155,7 +159,7 @@ func (s *AutomationsService) Run(id string) (map[string]any, error) {
 	return map[string]any{"ok": true, "runId": runID}, nil
 }
 
-// Runs 任务台账（limit 0 取默认 10）
+// Runs 任务台账（limit 0 取默认 10）；调度器不可用视为空台账（同 Web 口径）
 func (s *AutomationsService) Runs(id string, limit int) (map[string]any, error) {
 	v, err := s.view()
 	if err != nil {
@@ -165,11 +169,11 @@ func (s *AutomationsService) Runs(id string, limit int) (map[string]any, error) 
 		limit = 10
 	}
 	runs, err := v.History(id, limit)
+	if err != nil && !errors.Is(err, automation.ErrUnavailable) {
+		return nil, errNotFound(err.Error())
+	}
 	if runs == nil {
 		runs = []*automation.Run{}
-	}
-	if err != nil {
-		return nil, errNotFound(err.Error())
 	}
 	return map[string]any{"runs": runs}, nil
 }

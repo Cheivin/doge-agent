@@ -4,12 +4,15 @@
 package web
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -114,6 +117,10 @@ type Server struct {
 	// 备份并竞争写同一目标文件
 	applyMu sync.Mutex
 
+	// configMu 串行化全部配置文件的读-改-写段（settings/auth/models）：并发
+	// PUT/POST 都是 Load→改→Save，无锁并发丢更新（后写覆盖先写）
+	configMu sync.Mutex
+
 	// corsOrigins backs the CORS middleware (empty = no CORS headers).
 	corsOrigins []string
 
@@ -123,6 +130,11 @@ type Server struct {
 
 	windowsMu sync.Mutex
 	windows   map[string]*window
+
+	// pendingQuestions 记录各窗口待应答的 question（question 事件即登记，
+	// 应答成功即摘除），供 WS 重连快照重放
+	questionsMu      sync.Mutex
+	pendingQuestions map[string]map[string]agent.Question // windowID → qID → question
 
 	listener net.Listener
 }
@@ -158,18 +170,19 @@ func NewServer(opts Options) (*Server, error) {
 		addr = "127.0.0.1:8080"
 	}
 	s := &Server{
-		auth:           auth,
-		hub:            newHub(),
-		ctrl:           newControlTable(),
-		defaultBackend: opts.Backend,
-		windows:        map[string]*window{},
-		addr:           addr,
-		meshView:       opts.Mesh,
-		mcpView:        opts.Mcp,
-		automations:    opts.Automations,
-		shutdown:       opts.Shutdown,
-		uploads:        opts.Uploads,
-		corsOrigins:    opts.CorsOrigins,
+		auth:             auth,
+		hub:              newHub(),
+		ctrl:             newControlTable(),
+		defaultBackend:   opts.Backend,
+		windows:          map[string]*window{},
+		pendingQuestions: map[string]map[string]agent.Question{},
+		addr:             addr,
+		meshView:         opts.Mesh,
+		mcpView:          opts.Mcp,
+		automations:      opts.Automations,
+		shutdown:         opts.Shutdown,
+		uploads:          opts.Uploads,
+		corsOrigins:      opts.CorsOrigins,
 	}
 	if seed, ok := opts.Backend.(*sessionBackend); ok {
 		s.shared = seed.currentAgent()
@@ -202,6 +215,9 @@ func NewServer(opts Options) (*Server, error) {
 func (s *Server) newDefaultWindow() *window {
 	seed := s.defaultBackend
 	unsub, setKind := seed.Subscribe(func(ev agent.AgentEvent) error {
+		if ev.Type == agent.EventQuestion && ev.Question != nil {
+			s.rememberQuestion(defaultWindowID, *ev.Question)
+		}
 		data, err := marshalAgentEvent(ev)
 		if err != nil {
 			return err
@@ -217,6 +233,10 @@ func (s *Server) newWindow(id string) *window {
 	b := newWindowBackend(s.ctrl, s.shared, id, s.version, s.tuiActive)
 	b.ask = s.hub
 	unsub, setKind := b.Subscribe(func(ev agent.AgentEvent) error {
+		// 待答 question 随事件登记：重连快照据此重放提问卡片
+		if ev.Type == agent.EventQuestion && ev.Question != nil {
+			s.rememberQuestion(id, *ev.Question)
+		}
 		// Marshal a snapshot, never the live streaming partial: the adapter
 		// mutates it under the message lock while streaming, and marshaling
 		// under that lock inside the agent's emit chain must not block the
@@ -290,6 +310,83 @@ func (s *Server) onControlTransfer(key, owner string) {
 		return
 	}
 	s.hub.broadcast(data)
+}
+
+// rememberQuestion 登记 window 的待应答 question（重连快照重放用）
+func (s *Server) rememberQuestion(windowID string, q agent.Question) {
+	s.questionsMu.Lock()
+	m := s.pendingQuestions[windowID]
+	if m == nil {
+		m = map[string]agent.Question{}
+		s.pendingQuestions[windowID] = m
+	}
+	m[q.ID] = q
+	s.questionsMu.Unlock()
+}
+
+// forgetQuestion 摘除已应答的 question
+func (s *Server) forgetQuestion(windowID, id string) {
+	s.questionsMu.Lock()
+	if m := s.pendingQuestions[windowID]; m != nil {
+		delete(m, id)
+	}
+	s.questionsMu.Unlock()
+}
+
+// pendingQuestionFrames 返回 window 待应答 question 的重放帧（形状与
+// question 广播帧一致，按 id 排序保证输出稳定）
+func (s *Server) pendingQuestionFrames(windowID string) []map[string]any {
+	s.questionsMu.Lock()
+	defer s.questionsMu.Unlock()
+	ids := make([]string, 0, len(s.pendingQuestions[windowID]))
+	for id := range s.pendingQuestions[windowID] {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, map[string]any{"type": string(agent.EventQuestion), "question": s.pendingQuestions[windowID][id]})
+	}
+	return out
+}
+
+// watchQuestionAnswer 观察应答端点的结果：200 即已送达，从待答集合摘除该
+// 问题（重连快照不再重放已答问题）；api.go 的处理器本身语义不变。
+func (s *Server) watchQuestionAnswer(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			next(w, r)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var req struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(body, &req) != nil || req.ID == "" {
+			next(w, r)
+			return
+		}
+		rec := &statusRecorder{ResponseWriter: w}
+		next(rec, r)
+		if rec.code == http.StatusOK {
+			s.forgetQuestion(clientID(r), req.ID)
+		}
+	}
+}
+
+// statusRecorder 捕获响应状态码（writeJSON 总是显式 WriteHeader）
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (r *statusRecorder) WriteHeader(code int) { r.code = code; r.ResponseWriter.WriteHeader(code) }
+
+// IsSessionReadOnly 报告错误是否为"会话被其他窗口占用（只读）"的所有权
+// 错误（导出给桌面服务层区分只读 403 与磁盘/内部错误，纯判别不改语义）
+func IsSessionReadOnly(err error) bool {
+	return errors.Is(err, errSessionReadOnly)
 }
 
 // handleMesh 返回 mesh 网络状态（节点、peers、任务、转发规则）
@@ -385,7 +482,7 @@ func (s *Server) handler() http.Handler {
 	mux.Handle("POST /api/session/claim", s.requireAuth(s.handleSessionClaim))
 	mux.Handle("POST /api/session/takeover", s.requireAuth(s.handleSessionTakeover))
 	mux.Handle("POST /api/turn/edit", s.requireAuth(s.handleTurnEdit))
-	mux.Handle("POST /api/question/answer", s.requireAuth(s.handleQuestionAnswer))
+	mux.Handle("POST /api/question/answer", s.requireAuth(s.watchQuestionAnswer(s.handleQuestionAnswer)))
 	mux.Handle("POST /api/permission/answer", s.requireAuth(s.handlePermissionAnswer))
 	mux.Handle("GET /api/mesh", s.requireAuth(s.handleMesh))
 	mux.Handle("GET /api/mesh/forwards", s.requireAuth(s.handleMeshForwardsList))
@@ -588,6 +685,10 @@ func (s *Server) windowSnapshot(id string) ([]byte, error) {
 		"version":          st.Version,
 		"messages":         info.Messages,
 		"streamingMessage": streamingOrNil(st, b),
+		// 待交互状态重放：断线重连的客户端据此恢复提问/询问卡片（形状与
+		// 对应广播帧一致）
+		"pendingAsks":      s.hub.pendingAskFrames(),
+		"pendingQuestions": s.pendingQuestionFrames(id),
 	})
 }
 

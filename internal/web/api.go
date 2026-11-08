@@ -134,13 +134,14 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleReload re-reads models.json, auth.json and permission.json (global),
+// handleReload re-reads models.json, auth.json and permission.json across
+// EVERY live session (the shared one, per-window forks, remote-task forks),
 // and lands any pending per-session MCP toggle (see /api/session/mcp — the
 // manual "刷新生效" step).
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	b := s.backendFor(r)
 	mcpPending := b.McpInfo().Pending
-	if err := b.ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(b); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -342,7 +342,7 @@ func (s *UploadsService) applyModels(meta *uploads.Meta, confirm bool) (map[stri
 		return nil, errInternal(werr)
 	}
 	reloaded, reloadErr := true, ""
-	if err := s.d.Backend.ReloadConfig(); err != nil {
+	if err := reloadAllSessions(s.d); err != nil {
 		reloaded, reloadErr = false, err.Error()
 	}
 	logx.Infof("[desktop] models.json applied from upload %s (%d models)", meta.ID, len(models))
@@ -392,7 +392,7 @@ func (s *UploadsService) applySkillsZip(store *uploads.Store, meta *uploads.Meta
 	}
 	s.applyMu.Unlock()
 	reloaded, reloadErr := true, ""
-	if err := s.d.Backend.ReloadConfig(); err != nil {
+	if err := reloadAllSessions(s.d); err != nil {
 		reloaded, reloadErr = false, err.Error()
 	}
 	logx.Infof("[desktop] skills installed from upload %s: %s", meta.ID, strings.Join(installed, ","))
@@ -421,7 +421,7 @@ func (s *UploadsService) applyPermissions(meta *uploads.Meta, confirm bool) (map
 		return nil, errInternal(werr)
 	}
 	reloaded, reloadErr := true, ""
-	if err := s.d.Backend.ReloadConfig(); err != nil {
+	if err := reloadAllSessions(s.d); err != nil {
 		reloaded, reloadErr = false, err.Error()
 	}
 	logx.Infof("[desktop] permissions.json applied from upload %s", meta.ID)

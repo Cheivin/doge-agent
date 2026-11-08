@@ -362,7 +362,7 @@ function bindEvents() {
           setStatusText("已发送中断");
         } else {
           // 只读（403）或运行已结束（409）：刷新状态让按钮状态恢复正确。
-          setStatusText(r.status === 403 ? "无法中断：会话只读，请先接管" : "中断失败：运行可能已结束");
+          setStatusText(r.status === 403 ? "无法中断：会话只读，请先接管" : "中断失败：运行可能已结束", true);
           fetchStatus();
         }
       })
@@ -388,8 +388,8 @@ function bindEvents() {
   // 设置导航底部：Mesh / 重载 / 登出
   $("#nav-reload").addEventListener("click", () => {
     api("/api/reload", { method: "POST" })
-      .then((r) => setStatusText(r.ok ? "已重载 models/auth/permission 配置" : "重载失败"))
-      .catch(() => setStatusText("重载配置失败"));
+      .then((r) => setStatusText(r.ok ? "已重载 models/auth/permission 配置" : "重载失败", !r.ok))
+      .catch(() => setStatusText("重载配置失败", true));
   });
   $("#nav-logout").addEventListener("click", async () => {
     try { await api("/api/auth/logout", { method: "POST" }); } catch (_) {}
@@ -442,7 +442,7 @@ function bindEvents() {
           setStatusText("已删除会话");
           populateSessions();
         })
-        .catch((e) => setStatusText(String(e.message || e)));
+        .catch((e) => setStatusText(String(e.message || e), true));
       return;
     }
     const item = e.target.closest(".sess-item[data-id]");
@@ -468,7 +468,7 @@ function bindEvents() {
       })
       .catch((e) => {
         clearSwitching();
-        setStatusText(String(e.message || e));
+        setStatusText(String(e.message || e), true);
       });
   });
 
@@ -480,7 +480,8 @@ function bindEvents() {
   // Remote-task question modal.
   $("#question-submit").addEventListener("click", submitQuestion);
   $("#question-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    // 与主输入框一致：忽略 IME 选词回车（isComposing / keyCode 229）
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
       e.preventDefault();
       submitQuestion();
     }
@@ -685,9 +686,24 @@ function permResponse(response) {
   const ask = state.permAsk;
   state.permAsk = null;
   $("#perm").classList.add("hidden");
-  if (ask && state.ws && state.ws.readyState === WebSocket.OPEN) {
+  if (!ask) return;
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify({ type: "permission_response", id: ask.id, response }));
+    return;
   }
+  // 断线兜底：REST 应答（桌面端映射到 SessionService.PermissionAnswer）；
+  // 404/409 = 询问已过期
+  api("/api/permission/answer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ id: ask.id }, response)),
+  })
+    .then((r) => {
+      if (!r.ok) {
+        setStatusText(r.status === 404 || r.status === 409 ? "权限询问已失效（断线期间过期）" : "权限应答失败", true);
+      }
+    })
+    .catch((e) => setStatusText("权限应答发送失败: " + String(e.message || e), true));
 }
 
 // showQuestion surfaces a pending remote-task question (the master's bridge
@@ -719,12 +735,13 @@ function submitQuestion() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id: q.id, text }),
-  }).catch((e) => setStatusText(String(e.message || e)));
+  }).catch((e) => setStatusText(String(e.message || e), true));
 }
 
 /* ---------------- turn editing ---------------- */
 // userSeqOf returns the ordinal (0-based) of msg among user messages in the
-// current transcript, matching the backend's message view.
+// loaded window; add state.userOffset to get the server-side (whole
+// transcript) ordinal used by turn/edit.
 function userSeqOf(msg) {
   let seq = 0;
   for (const m of state.messages) {
@@ -760,7 +777,7 @@ function startEditUserMessage(wrap, msg) {
   save.addEventListener("click", () => {
     const text = ta.value.trim();
     if (!text) {
-      setStatusText("消息不能为空");
+      setStatusText("消息不能为空", true);
       return;
     }
     saveEdit(seq, text);
@@ -773,6 +790,9 @@ function startEditUserMessage(wrap, msg) {
 // is applied optimistically so the incoming stream appends to the rewritten
 // transcript; a failed request reloads the server truth.
 function saveEdit(seq, text) {
+  // 服务端 RewriteTurn 按全量转录数用户消息，本地只有尾部窗口：提交前补上
+  // 窗口之前的用户消息数，否则翻页加载过后编辑会错位回退到更早的回合
+  const globalSeq = (state.userOffset || 0) + seq;
   let idx = -1;
   let seen = 0;
   for (let i = 0; i < state.messages.length; i++) {
@@ -785,7 +805,7 @@ function saveEdit(seq, text) {
     }
   }
   if (idx < 0) {
-    setStatusText("消息位置无效");
+    setStatusText("消息位置无效", true);
     return;
   }
   state.messages = state.messages.slice(0, idx);
@@ -796,7 +816,7 @@ function saveEdit(seq, text) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ seq, text }),
+    body: JSON.stringify({ seq: globalSeq, text }),
   })
     .then((r) => {
       if (!r.ok) {
@@ -806,7 +826,7 @@ function saveEdit(seq, text) {
       }
     })
     .catch((e) => {
-      setStatusText(String(e.message || e));
+      setStatusText(String(e.message || e), true);
       loadSession(); // restore server truth on failure
     });
 }
@@ -918,7 +938,7 @@ function renderCtxPanel(panel, st) {
     compact.disabled = true;
     api("/api/compact", { method: "POST" })
       .then(() => setStatusText("已发起上下文压缩"))
-      .catch(() => setStatusText("压缩失败"))
+      .catch(() => setStatusText("压缩失败", true))
       .finally(() => (compact.disabled = false));
   });
   foot.appendChild(compact);
@@ -1230,7 +1250,7 @@ async function onMcpAction(e) {
         const rl = await api("/api/mcp/reload", { method: "POST" });
         if (!rl.ok) {
           const e = ((await rl.json()) || {}).error;
-          setStatusText("已删除 " + btn.dataset.server + "，但重新加载失败：" + (e || "未知错误"));
+          setStatusText("已删除 " + btn.dataset.server + "，但重新加载失败：" + (e || "未知错误"), true);
           btn.disabled = false;
           return;
         }
@@ -1280,7 +1300,7 @@ async function onMcpAction(e) {
         const rl = await api("/api/mcp/reload", { method: "POST" });
         if (!rl.ok) {
           const e = ((await rl.json()) || {}).error;
-          setStatusText("已写入项目 .doge/mcp.json，但重新加载失败：" + (e || "未知错误"));
+          setStatusText("已写入项目 .doge/mcp.json，但重新加载失败：" + (e || "未知错误"), true);
           btn.disabled = false;
           return;
         }
@@ -1291,7 +1311,7 @@ async function onMcpAction(e) {
         return;
     }
   } catch (err) {
-    setStatusText("✗ " + String(err.message || err));
+    setStatusText("✗ " + String(err.message || err), true);
     btn.disabled = false;
     return;
   }
@@ -1604,7 +1624,7 @@ function setThinkingLevel(level) {
       updateThinkingBtn();
       setStatusText("思考级别：" + thinkingLabel(level));
     })
-    .catch(() => setStatusText("思考级别设置失败"));
+    .catch(() => setStatusText("思考级别设置失败", true));
 }
 
 function openModelMenu(anchor) {
@@ -1676,7 +1696,7 @@ function switchModel(spec) {
       updateModelBtn();
       setStatusText("模型：" + spec);
     })
-    .catch(() => setStatusText("模型切换失败"));
+    .catch(() => setStatusText("模型切换失败", true));
 }
 
 /* ---------------- ＋菜单（附件/技能）与项目目录 picker ---------------- */
@@ -1750,7 +1770,7 @@ function newSessionIn(cwd) {
       if (!r.ok) throw new Error((r.status === 409 ? "运行中，请先中断" : "新建会话失败"));
       setStatusText("已在新目录打开会话：" + cwd);
     })
-    .catch((e) => setStatusText(String(e.message || e)));
+    .catch((e) => setStatusText(String(e.message || e), true));
 }
 
 /* ---------------- 新建会话窗口 ---------------- */
@@ -1956,7 +1976,7 @@ function submitNewTask() {
       $("#nt-send").disabled = false;
     })
     .catch((e) => {
-      setStatusText(String(e.message || e));
+      setStatusText(String(e.message || e), true);
       $("#nt-send").disabled = false;
     });
 }
@@ -1982,15 +2002,18 @@ function loadSession() {
     .then((info) => {
       state.messages = info.messages || [];
       state.msgOffset = info.earlierCount || 0;
+      // userOffset：加载窗口之前的用户消息数（服务端按全量转录计数）；缺席回退 0
+      state.userOffset = typeof info.userOffset === "number" ? info.userOffset : 0;
       state.sessionKind = info.kind || "";
       state.sessionSourceName = info.sourceName || "";
       state.sessionSourcePeer = info.sourcePeerId || "";
       renderAll();
+      clearSwitching(); // 会话加载完成，切换守卫即使 session_reset 丢失也能解除
     })
-    .catch((e) => setStatusText("加载会话失败：" + String((e && e.message) || e)))
+    .catch((e) => setStatusText("加载会话失败：" + String((e && e.message) || e), true))
     .finally(() => {
       $("#messages").classList.remove("pane-loading");
-      setStatusText("");
+      if (!sbSticky) setStatusText(""); // 加载失败时保留粘性错误
     });
 }
 
@@ -2015,6 +2038,8 @@ function fetchStatus() {
       }
       setBusy(st.streaming);
       setReadOnly(st.writable === false);
+      // 粘性错误提示不被周期轮询覆盖（接管按钮仍常驻侧栏可点）
+      if (sbSticky) return;
       if (st.writable === false) {
         setStatusText(st.owner ? "会话正被「" + st.owner + "」使用（只读）" : "会话正被其他窗口使用（只读）");
       } else {
@@ -2055,6 +2080,11 @@ function connectWS() {
     state.connected = true;
     state.retry = 0;
     $("#conn-dot").className = "status-dot on";
+    // 断线期间保留的权限/提问弹窗重挂（应答走 fake socket / REST 兜底）
+    if (state.permAsk) showPermAsk(state.permAsk);
+    if (state.question) showQuestion({ question: state.question });
+    // 重连即视图重建，切换守卫不再等可能丢失的 session_reset
+    clearSwitching();
   };
   sock.onmessage = (e) => {
     let msg;
@@ -2094,12 +2124,19 @@ function scheduleStreamRender() {
 function handleEvent(m) {
   switch (m.type) {
     case "session_info": {
+      // 快照即视图重建：切换守卫不再等可能丢失的 session_reset
+      clearSwitching();
       state.messages = m.messages || [];
       state.msgOffset = m.earlierCount || 0;
+      // 快照携带 userOffset（窗口之前的用户消息数）则采用，缺席保留现值
+      if (typeof m.userOffset === "number") state.userOffset = m.userOffset;
       state.streaming = m.streaming ? (m.streamingMessage || { role: "assistant", content: [] }) : null;
       if (m.sessionId) state.sessionId = m.sessionId;
       setBusy(!!m.streaming);
       renderAll();
+      // 重连快照若携带仍未应答的权限/提问则恢复弹窗（渐进增强字段，缺席不动）
+      if (Array.isArray(m.pendingAsks) && m.pendingAsks.length) showPermAsk(m.pendingAsks[m.pendingAsks.length - 1]);
+      if (Array.isArray(m.pendingQuestions) && m.pendingQuestions.length) showQuestion(m.pendingQuestions[m.pendingQuestions.length - 1]);
       if (m.model) {
         state.modelSpec = m.model;
         updateModelBtn();
@@ -2203,9 +2240,14 @@ function setBusy(busy) {
 }
 
 let sbHoldUntil = 0; // 操作反馈保留截止（见 setStatusText）
-function setStatusText(t) {
-  $("#sb-status-text").textContent = t;
-  // 操作反馈保留 4s：5s 轮询的「就绪」不覆盖刚设置的提示（fetchStatus 里只豁免常态文案）
+let sbSticky = false; // 当前是粘性错误提示：不被 5s 轮询覆盖，直到下一次非粘性提示
+function setStatusText(t, sticky) {
+  const el = $("#sb-status-text");
+  el.textContent = sticky ? "⚠ " + t : t;
+  el.classList.toggle("error", !!sticky);
+  // 粘性错误（发送/接管/保存失败等）持续显示；任何常规提示（发送成功、切会话、
+  // 接管成功…）都会解除粘性。普通反馈仍保留 4s：5s 轮询的「就绪」不覆盖。
+  sbSticky = !!sticky && !!t;
   sbHoldUntil = Date.now() + 4000;
 }
 
@@ -2352,10 +2394,34 @@ function renderAll() {
     host.appendChild(renderTurn(turn, isLast && state.busy));
   });
   ensureLive();
-  if (state.streaming) renderStreaming();
+  remountLiveCards();
   host.scrollTop = stick
     ? host.scrollHeight
     : Math.max(0, host.scrollHeight - dist - host.clientHeight);
+}
+
+// remountLiveCards 全量重渲后把仍在跑的实时内容挂回新 DOM：renderAll 清空了
+// #messages，streamingEl/芯片引用的旧节点已脱离文档（不处理则直播输出消失）。
+// 芯片清空注册表后按最近状态/参数重挂（含已收到的部分输出）；流式卡片重置
+// 引用走 message_start 同款路径重建。
+function remountLiveCards() {
+  const chips = [...state.toolChips.values()];
+  state.toolChips = new Map();
+  for (const rec of chips) {
+    addToolChip(rec.id, rec.name, rec.args, rec.status);
+    const fresh = state.toolChips.get(rec.id);
+    const text = rec.out ? rec.out.textContent : "";
+    if (fresh && text) {
+      fresh.out = document.createElement("div");
+      fresh.out.className = "fold-content";
+      fresh.out.textContent = text;
+      fresh.chip.appendChild(fresh.out);
+    }
+  }
+  if (state.streaming) {
+    state.streamingEl = null;
+    renderStreaming();
+  }
 }
 
 function appendMessageDOM(msg) {
@@ -2777,7 +2843,7 @@ function addToolChip(id, name, args, status) {
     c.textContent = JSON.stringify(args, null, 2);
     chip.appendChild(c);
   }
-  state.toolChips.set(id, { chip, dot, out: null });
+  state.toolChips.set(id, { id, chip, dot, out: null, name, args: args || {}, status });
   followScroll(() => live.before(chip)); // sit after the committed messages
 }
 
@@ -2811,6 +2877,7 @@ function toolResultText(result) {
 function updateToolChip(id, result, status) {
   const rec = state.toolChips.get(id);
   if (!rec) return;
+  rec.status = status;
   rec.dot.className = "tool-status " + status;
   const text = stripAnsi(toolResultText(result));
   if (text) {
@@ -2864,7 +2931,7 @@ function uploadFiles(files) {
       if (j.error) throw new Error(j.error);
       for (const u of j.uploads || []) {
         if (u.error) {
-          setStatusText("「" + u.name + "」上传失败: " + u.error);
+          setStatusText("「" + u.name + "」上传失败: " + u.error, true);
           continue;
         }
         state.pendingUploads.push({ id: u.id, name: u.name, size: u.size, mimeType: u.mimeType });
@@ -2872,7 +2939,7 @@ function uploadFiles(files) {
       renderAttachTray();
       setStatusText("");
     })
-    .catch((e) => setStatusText("上传失败: " + String(e.message || e)));
+    .catch((e) => setStatusText("上传失败: " + String(e.message || e), true));
 }
 
 // renderAttachTray redraws the staged-attachment chips above the input.
@@ -2984,7 +3051,7 @@ function sendMessage() {
         // Session is read-only: another window / the TUI is using it. Queue
         // for control and surface the explicit force-takeover affordance.
         setReadOnly(true);
-        setStatusText("会话正被其他窗口使用（只读），正在请求接管…可点「强制夺取」立即接管");
+        setStatusText("会话正被其他窗口使用（只读），正在请求接管…可点「强制夺取」立即接管", true);
         claimControl();
         throw null; // already surfaced by claimControl
       }
@@ -2997,7 +3064,7 @@ function sendMessage() {
       state.pendingUploads = [];
       renderAttachTray();
     })
-    .catch((e) => { if (e) setStatusText(String(e.message || e)); })
+    .catch((e) => { if (e) setStatusText(String(e.message || e), true); })
     .finally(() => { input.disabled = state.busy; $("#send-btn").disabled = state.busy; $("#attach-btn").disabled = state.busy; });
 }
 
@@ -3015,7 +3082,7 @@ function claimControl() {
         setReadOnly(true);
         setStatusText("已排队：等待当前使用窗口让出该会话后自动接管，或点「强制夺取」立即接管");
       } else {
-        setStatusText("会话控制权请求失败");
+        setStatusText("会话控制权请求失败", true);
       }
     })
     .catch((e) => setStatusText("接管失败: " + String(e.message || e)));
@@ -3045,7 +3112,7 @@ async function takeoverControl() {
         setStatusText(j.prevOwner ? "已强制夺取控制权（原持有者: " + j.prevOwner + "）" : "已获得会话控制权");
         fetchStatus();
       } else {
-        setStatusText("强制夺取失败");
+        setStatusText("强制夺取失败", true);
       }
     })
     .catch((e) => setStatusText("强制夺取失败: " + String(e.message || e)));
@@ -3078,10 +3145,10 @@ async function installSkillZip(file) {
       body: JSON.stringify({ kind: "skills-zip", confirm: true }),
     }).then((r) => r.json());
     if (!done.ok) throw new Error(done.error || "安装失败");
-    setStatusText(done.error ? "已安装但刷新失败: " + done.error : "技能已安装: " + (done.installed || []).join(", "));
+    setStatusText(done.error ? "已安装但刷新失败: " + done.error : "技能已安装: " + (done.installed || []).join(", "), !!done.error);
     openSkills(); // 刷新面板
   } catch (e) {
-    setStatusText("安装失败: " + String(e.message || e));
+    setStatusText("安装失败: " + String(e.message || e), true);
   }
 }
 
@@ -3203,7 +3270,7 @@ function skillRow(sk, installed) {
         if (!r.ok) throw new Error((await r.json()).error || "设置失败");
         openSkills();
       } catch (e) {
-        setStatusText("技能开关失败：" + (e.message || e));
+        setStatusText("技能开关失败：" + (e.message || e), true);
         toggle.disabled = false;
       }
     });
@@ -3219,7 +3286,7 @@ function skillRow(sk, installed) {
         if (!r.ok) throw new Error((await r.json()).error || "删除失败");
         openSkills();
       } catch (e) {
-        setStatusText("技能删除失败：" + (e.message || e));
+        setStatusText("技能删除失败：" + (e.message || e), true);
         del.disabled = false;
       }
     });
@@ -3316,7 +3383,7 @@ function renderSettingsModels(custom) {
   defBar.title = "新会话/下次启动使用的模型；修改后当前会话立即切换";
   defSel.addEventListener("change", () => {
     if (!defSel.value) return;
-    applyDefaultModel(defSel.value, true).then(loadModels).catch((e) => setStatusText(String(e.message || e)));
+    applyDefaultModel(defSel.value, true).then(loadModels).catch((e) => setStatusText(String(e.message || e), true));
   });
 
   for (const p of providers) {
@@ -3417,7 +3484,7 @@ function modelRow(m, custom) {
           loadSettingsModels();
         })
         .catch((e) => {
-          setStatusText(String(e.message || e));
+          setStatusText(String(e.message || e), true);
           del.disabled = false;
         });
     });
@@ -3453,7 +3520,7 @@ function saveModelForm(orig) {
   const provider = $("#mf-provider").value.trim();
   const id = $("#mf-id").value.trim();
   if (!provider || !id) {
-    setStatusText("provider 和模型 ID 不能为空");
+    setStatusText("provider 和模型 ID 不能为空", true);
     return;
   }
   const input = [];
@@ -3490,7 +3557,7 @@ function saveModelForm(orig) {
       loadModels();
       fetchStatus();
     })
-    .catch((e) => setStatusText(String(e.message || e)));
+    .catch((e) => setStatusText(String(e.message || e), true));
 }
 
 /* ---------------- 首跑配置向导与密钥管理 ---------------- */
@@ -3787,7 +3854,7 @@ async function applyWizard() {
     loadModels();
     fetchStatus();
   } catch (e) {
-    setStatusText("配置失败：" + (e.message || e));
+    setStatusText("配置失败：" + (e.message || e), true);
   }
 }
 
@@ -3837,7 +3904,7 @@ function openDefaultModelBanner() {
   apply.textContent = "设为默认";
   apply.addEventListener("click", async () => {
     if (!sel.value) return;
-    applyDefaultModel(sel.value, true).then(closeSetup).catch((e) => setStatusText(String(e.message || e)));
+    applyDefaultModel(sel.value, true).then(closeSetup).catch((e) => setStatusText(String(e.message || e), true));
   });
   bar.appendChild(apply);
   const close = document.createElement("button");
@@ -4038,8 +4105,8 @@ function keyRow(p, authEntry, count, models, providers) {
   const del = document.createElement("button");
   del.textContent = "删除";
   if (authEntry) {
-    del.addEventListener("click", () => {
-      if (!confirm("删除 " + (p.name || p.id) + " 的密钥？")) return;
+    del.addEventListener("click", async () => {
+      if (!(await desktopConfirm("删除 " + (p.name || p.id) + " 的密钥？"))) return;
       del.disabled = true;
       api("/api/config/auth/" + encodeURIComponent(p.id), { method: "DELETE" })
         .then(async (r) => {
@@ -4049,7 +4116,7 @@ function keyRow(p, authEntry, count, models, providers) {
           loadModels();
         })
         .catch((e) => {
-          setStatusText(String(e.message || e));
+          setStatusText(String(e.message || e), true);
           del.disabled = false;
         });
     });
@@ -4103,11 +4170,11 @@ function openKeyForm(panel, providers, models, preset) {
     const provider = provSel.value === "__custom__" ? customName.value.trim() : provSel.value;
     const key = keyInput.value.trim();
     if (!provider) {
-      setStatusText("请选择或输入 provider");
+      setStatusText("请选择或输入 provider", true);
       return;
     }
     if (!key) {
-      setStatusText("请粘贴 API key");
+      setStatusText("请粘贴 API key", true);
       return;
     }
     save.disabled = true;
@@ -4124,7 +4191,7 @@ function openKeyForm(panel, providers, models, preset) {
         loadModels();
       })
       .catch((e) => {
-        setStatusText(String(e.message || e));
+        setStatusText(String(e.message || e), true);
         save.disabled = false;
       });
   });
@@ -4278,7 +4345,7 @@ function autoCard(c, reload) {
       setStatusText("已触发 " + c.id + "（后台执行）");
       setTimeout(reload, 1500);
     } catch (e) {
-      setStatusText(String(e.message || e));
+      setStatusText(String(e.message || e), true);
       run.disabled = false;
     }
   });
@@ -4293,7 +4360,7 @@ function autoCard(c, reload) {
       if (!r.ok) throw new Error((await r.json()).error || "操作失败");
       reload();
     } catch (e) {
-      setStatusText(String(e.message || e));
+      setStatusText(String(e.message || e), true);
       toggle.disabled = false;
     }
   });
@@ -4304,8 +4371,8 @@ function autoCard(c, reload) {
   ops.appendChild(hist);
   const del = document.createElement("button");
   del.textContent = "删除";
-  del.addEventListener("click", () => {
-    if (!confirm("删除定时任务「" + (c.title || c.id) + "」？")) return;
+  del.addEventListener("click", async () => {
+    if (!(await desktopConfirm("删除定时任务「" + (c.title || c.id) + "」？"))) return;
     del.disabled = true;
     api("/api/automations/" + encodeURIComponent(c.id), { method: "DELETE" })
       .then(async (r) => {
@@ -4313,7 +4380,7 @@ function autoCard(c, reload) {
         reload();
       })
       .catch((e) => {
-        setStatusText(String(e.message || e));
+        setStatusText(String(e.message || e), true);
         del.disabled = false;
       });
   });
@@ -4509,7 +4576,7 @@ function openAutoForm(panel, onSaved) {
     const title = titleInput.value.trim();
     const prompt = promptInput.value.trim();
     if (!title || !prompt) {
-      setStatusText("标题和 Prompt 不能为空");
+      setStatusText("标题和 Prompt 不能为空", true);
       return;
     }
     const schedule = { kind: fs.kind };
@@ -4542,7 +4609,7 @@ function openAutoForm(panel, onSaved) {
       setStatusText("定时任务已创建：" + title);
       onSaved();
     } catch (e) {
-      setStatusText(String(e.message || e));
+      setStatusText(String(e.message || e), true);
       save.disabled = false;
     }
   });
@@ -4656,9 +4723,11 @@ function mdToHtml(src, block = true) {
       html += "<hr>\n";
       continue;
     }
-    if (/^>\s?/.test(raw)) {
+    // 引用块：输入已先整体转义，行首 ">" 变成了 "&gt;"，必须按转义形态匹配；
+    // 字面 "&gt; x" 会被再转义成 "&amp;gt;"，天然不会误判为引用
+    if (/^&gt;\s?/.test(raw)) {
       flushPara(); closeList();
-      html += "<blockquote>" + inline(raw.replace(/^>\s?/, "")) + "</blockquote>\n";
+      html += "<blockquote>" + inline(raw.replace(/^&gt;\s?/, "")) + "</blockquote>\n";
       continue;
     }
     let m = raw.match(/^(\s*)([-*+])\s+(.*)$/);
@@ -4788,6 +4857,9 @@ window.dogeMenu = {
 /* ============ desktop：转录分片加载（大转录防冻结） ============ */
 state.msgOffset = 0;
 state.loadingEarlier = false;
+// userOffset：加载窗口之前（更早分片里）的用户消息数，turn/edit 提交时补上，
+// 使本地窗口序号对齐服务端的全量转录序号；服务端不给该字段时保持 0（旧行为）
+state.userOffset = 0;
 
 // 上滑到顶部自动加载更早消息（无需手动点按钮）
 $("#messages").addEventListener("scroll", () => {
@@ -4808,14 +4880,18 @@ function loadEarlier() {
       const got = j.messages || [];
       state.messages = got.concat(state.messages);
       state.msgOffset = typeof j.offset === "number" ? j.offset : state.msgOffset - got.length;
+      // 窗口起点前移：优先用服务端给的 userOffset，缺席时按本批用户消息数递推
+      // （服务端从不给则恒为 0，等同旧行为）
+      if (typeof j.userOffset === "number") state.userOffset = j.userOffset;
+      else state.userOffset = Math.max(0, state.userOffset - got.filter((msg) => msg.role === "user").length);
       renderAll();
       // 顶部补页：锚定用户当前阅读位置，不跳底不跳动
       m.scrollTop = m.scrollHeight - prevHeight + prevTop;
     })
-    .catch((e) => setStatusText(String((e && e.message) || e)))
+    .catch((e) => setStatusText(String((e && e.message) || e), true))
     .finally(() => {
       state.loadingEarlier = false;
-      setStatusText("");
+      if (!sbSticky) setStatusText("");
       // 锚定后仍贴着顶部（一批不够铺满一屏）则继续补
       if (m.scrollTop < 120 && state.msgOffset > 0) loadEarlier();
     });
@@ -4861,7 +4937,8 @@ function desktopModal(opts) {
     cancel.onclick = () => done(opts.input ? null : false);
     ok.onclick = () => done(opts.input ? inp.value : true);
     box.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ok.click(); }
+      // 忽略 IME 选词回车（对齐主输入框的 isComposing / keyCode 229 守卫）
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); ok.click(); }
       if (e.key === "Escape") done(opts.input ? null : false);
     });
     (inp || ok).focus();
@@ -5105,9 +5182,9 @@ async function loadSettingsPerm() {
         body: JSON.stringify(policy),
       }).then((r) => r.json());
       if (j.ok === false) throw new Error(j.error || "保存失败");
-      setStatusText(j.reloaded === false ? "已保存（热重载失败：" + (j.error || "") + "）" : "已保存并热重载权限策略");
+      setStatusText(j.reloaded === false ? "已保存（热重载失败：" + (j.error || "") + "）" : "已保存并热重载权限策略", j.reloaded === false);
     } catch (e) {
-      setStatusText("保存失败：" + String(e.message || e));
+      setStatusText("保存失败：" + String(e.message || e), true);
     }
     save.disabled = false;
   });
@@ -5145,7 +5222,7 @@ async function openMeshDesktop() {
       setStatusText(on ? "mesh 节点已启动" : "mesh 节点已停止");
     } catch (e) {
       sw.inp.checked = running.running; // 启停失败回弹到真实状态
-      setStatusText("✗ " + String((e && e.message) || e));
+      setStatusText("✗ " + String((e && e.message) || e), true);
     }
     sw.inp.disabled = false;
     openMeshDesktop(); // 重渲染反映运行态（节点卡/任务列表）
@@ -5235,7 +5312,7 @@ async function openMeshDesktop() {
       setStatusText(j.restarted ? "已保存并重启 mesh 节点（权限即时生效）" : "已保存（节点未运行，启动时生效）");
       setTimeout(() => {}, 0);
     } catch (e) {
-      setStatusText("保存失败：" + String(e.message || e));
+      setStatusText("保存失败：" + String(e.message || e), true);
     }
     save.disabled = false;
   });

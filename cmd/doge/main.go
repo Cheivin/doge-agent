@@ -295,6 +295,7 @@ func parseArgs(args []string) cliOptions {
 	fs.StringVar(&opts.skills, "skill", "", "additional skill directory")
 	fs.StringVar(&opts.prompts, "prompts", "", "additional prompt template directory")
 	fs.BoolVar(&opts.approve, "approve", false, "auto-approve project trust")
+	fs.BoolVar(&opts.approve, "y", false, "auto-approve project trust (alias of --approve)")
 	fs.BoolVar(&opts.showModels, "list-models", false, "list available models and exit")
 	fs.StringVar(&opts.export, "export", "", "export a session to an HTML file (path or session id)")
 	fs.StringVar(&opts.importZCode, "import-zcode", "", "import ZCode desktop sessions from a SQLite db (empty value: ~/.zcode/cli/db/db.sqlite)")

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"doge/internal/ai"
 	"doge/internal/coding"
 	"doge/internal/coding/permissions"
 	"doge/internal/web"
@@ -30,7 +31,10 @@ func (s *SessionService) Status() web.Status { return s.d.Backend.Status() }
 // Stats 用量统计
 func (s *SessionService) Stats() coding.SessionStats { return s.d.Backend.Stats() }
 
-// Info 当前会话与转录（尾部 tailMessages 条 + earlierCount，更早的分片拉）
+// Info 当前会话与转录（尾部 tailMessages 条 + earlierCount，更早的分片拉）。
+// userOffset 是被分片切掉的头部里 user 消息数：桌面"编辑重发"的本地序号
+// 只数已加载尾部，服务端 RewriteTurn 按全量转录计数——前端以
+// userOffset + 本地序号回传才能对准同一轮
 func (s *SessionService) Info() (map[string]any, error) {
 	start := time.Now()
 	info := s.d.Backend.SessionInfo()
@@ -50,10 +54,12 @@ func (s *SessionService) Info() (map[string]any, error) {
 		"sourcePeerId": info.SourcePeerID,
 		"kind":         info.Kind,
 		"earlierCount": earlier,
+		"userOffset":   countUser(info.Messages[:earlier]),
 	}, nil
 }
 
-// MessagesBefore 分片拉取 index 之前的消息（转录头部按需加载）
+// MessagesBefore 分片拉取 index 之前的消息（转录头部按需加载）。
+// userOffset 与 Info 同义：本批之前所有未加载消息里的 user 数
 func (s *SessionService) MessagesBefore(index, limit int) (map[string]any, error) {
 	start := time.Now()
 	msgs := s.d.Backend.SessionInfo().Messages
@@ -68,7 +74,22 @@ func (s *SessionService) MessagesBefore(index, limit int) (map[string]any, error
 		begin = 0
 	}
 	logx.Infof("[desktop] MessagesBefore %d-%d/%d cost=%s", begin, index, len(msgs), time.Since(start))
-	return map[string]any{"messages": msgs[begin:index], "offset": begin}, nil
+	return map[string]any{
+		"messages":   msgs[begin:index],
+		"offset":     begin,
+		"userOffset": countUser(msgs[:begin]),
+	}, nil
+}
+
+// countUser 数消息切片里的 user 条数
+func countUser(msgs []*ai.Message) int {
+	n := 0
+	for _, m := range msgs {
+		if m != nil && m.Role == ai.RoleUser {
+			n++
+		}
+	}
+	return n
 }
 
 // List 已持久化会话列表
@@ -88,10 +109,19 @@ func (s *SessionService) Models(all bool) []web.ModelInfo {
 	return s.d.Backend.ListModels()
 }
 
+// sessionErr 会话写操作错误归类：只读所有权错误标记 readonly（对应 Web 的
+// 403），其余（磁盘/内部故障）按内部错误透传，避免误报"其他窗口占用"
+func sessionErr(err error) error {
+	if web.IsSessionReadOnly(err) {
+		return errReadOnly(err.Error())
+	}
+	return errInternal(err)
+}
+
 // New 新建会话（cwd 空用当前目录），成功后发 session_reset
 func (s *SessionService) New(cwd string) error {
 	if err := s.d.Backend.NewSessionIn(strings.TrimSpace(cwd)); err != nil {
-		return errReadOnly(err.Error())
+		return sessionErr(err)
 	}
 	s.d.Console.EmitFrame(map[string]any{"type": "session_reset"})
 	return nil
@@ -101,7 +131,7 @@ func (s *SessionService) New(cwd string) error {
 func (s *SessionService) Switch(id string) error {
 	start := time.Now()
 	if err := s.d.Backend.SwitchSession(id); err != nil {
-		return errReadOnly(err.Error())
+		return sessionErr(err)
 	}
 	logx.Infof("[desktop] Switch %s cost=%s", id, time.Since(start))
 	s.d.Console.EmitFrame(map[string]any{"type": "session_reset"})

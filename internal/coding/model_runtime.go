@@ -3,6 +3,7 @@ package coding
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"doge/internal/ai"
 	"doge/pkg/logx"
@@ -15,7 +16,11 @@ type ModelRuntime struct {
 	Auth   *AuthStore
 
 	// customFirst 是 models.json 里的第一个自定义模型（用户显式配置的第一个，
-	// 默认模型 fallback 链的第二优先级）；AddCustomModels/Reload 时更新
+	// 默认模型 fallback 链的第二优先级）；AddCustomModels/Reload 时更新。
+	// mu 保护 customFirst 与 Reload 的整体过程：HTTP 配置写盘后的热重载扇出
+	// 会并发触发多个会话各 Reload 一次共享 runtime（web/config.go
+	// reloadAfterConfigWrite），无锁读写 slice 头/指针会撞 race
+	mu          sync.Mutex
 	customFirst *ai.Model
 }
 
@@ -31,6 +36,8 @@ func NewModelRuntime(auth *AuthStore) *ModelRuntime {
 
 // AddCustomModels registers user-defined models from models.json.
 func (r *ModelRuntime) AddCustomModels(modelsFile string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	custom, err := LoadCustomModels(modelsFile)
 	if err != nil {
 		return err
@@ -47,7 +54,11 @@ func (r *ModelRuntime) AddCustomModels(modelsFile string) error {
 // Reload re-reads models.json and rebuilds the catalog (built-ins plus custom
 // models), so price/billing edits take effect without a restart. A missing
 // file keeps just the built-ins; a parse error leaves the catalog untouched.
+// 串行化并发 Reload：Reset 与 re-add 交错会让并发 GetModel 瞬时 miss，
+// SwitchModel 报 unknown model
 func (r *ModelRuntime) Reload(modelsFile string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	custom, err := LoadCustomModels(modelsFile)
 	if err != nil {
 		return err
@@ -102,9 +113,12 @@ func (r *ModelRuntime) ResolveModel(spec string) (*ai.Model, string, error) {
 // settings default resolve it themselves and fall back here when it no longer
 // exists (renamed/deleted models.json entry).
 func (r *ModelRuntime) DefaultModel() (*ai.Model, string, error) {
-	// 用户配置的第一个自定义模型优先
-	if r.customFirst != nil {
-		if m, ok := r.Models.GetModel(r.customFirst.Provider, r.customFirst.ID); ok {
+	// 用户配置的第一个自定义模型优先（快照读，避免与 Reload 竞态）
+	r.mu.Lock()
+	first := r.customFirst
+	r.mu.Unlock()
+	if first != nil {
+		if m, ok := r.Models.GetModel(first.Provider, first.ID); ok {
 			return m, "", nil
 		}
 	}

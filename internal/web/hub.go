@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,6 +24,29 @@ const (
 	clientBuffer = 512             // max queued broadcast frames per client
 	maxInbound   = 1 << 20         // max inbound WS message size (1 MiB)
 )
+
+// 保活参数（atomic 便于测试注入短超时，writeLoop 运行中并发读取）；写超时
+// 须大于正常帧的最大耗时
+var (
+	wsWriteTimeout atomic.Int64 // 单帧写超时（ns），默认 10s
+	wsPingInterval atomic.Int64 // 保活 ping 周期（ns），默认 30s
+)
+
+const (
+	defaultWriteTimeout = 10 * time.Second // 单帧写超时（对端停止读则写失败退出）
+	defaultPingInterval = 30 * time.Second // 保活 ping 周期（探测无 close 帧的死连接）
+)
+
+func init() {
+	wsWriteTimeout.Store(int64(defaultWriteTimeout))
+	wsPingInterval.Store(int64(defaultPingInterval))
+}
+
+// pendingAsk 一条待应答的权限询问（快照重放需要原始请求）
+type pendingAsk struct {
+	req   permissions.AskRequest
+	reply chan permissions.AskResponse
+}
 
 // Hub manages WebSocket clients and routes agent events to them. Each client
 // belongs to a window (its clientID); agent events are pushed only to the
@@ -38,7 +63,7 @@ type Hub struct {
 	windows map[string]map[*client]struct{} // windowID → clients
 
 	askMu    sync.Mutex
-	asks     map[string]chan permissions.AskResponse
+	asks     map[string]*pendingAsk
 	serialID int64
 
 	// snapshotFn builds the session_info frame a new client of a window needs
@@ -71,7 +96,7 @@ func newHub() *Hub {
 	return &Hub{
 		clients: map[*client]struct{}{},
 		windows: map[string]map[*client]struct{}{},
-		asks:    map[string]chan permissions.AskResponse{},
+		asks:    map[string]*pendingAsk{},
 	}
 }
 
@@ -198,7 +223,7 @@ func (h *Hub) Ask(req permissions.AskRequest) (permissions.AskResponse, error) {
 	id := h.nextAskID()
 	reply := make(chan permissions.AskResponse, 1)
 	h.askMu.Lock()
-	h.asks[id] = reply
+	h.asks[id] = &pendingAsk{req: req, reply: reply}
 	h.askMu.Unlock()
 	defer func() {
 		h.askMu.Lock()
@@ -251,16 +276,33 @@ func (h *Hub) handleInbound(data []byte) {
 // reports whether the ask was still pending.
 func (h *Hub) answerPermission(id string, resp permissions.AskResponse) bool {
 	h.askMu.Lock()
-	reply := h.asks[id]
+	p := h.asks[id]
 	h.askMu.Unlock()
-	if reply == nil {
+	if p == nil {
 		return false
 	}
 	select {
-	case reply <- resp:
+	case p.reply <- resp:
 	default:
 	}
 	return true
+}
+
+// pendingAskFrames 返回待应答权限询问的重放帧（快照字段用，形状与
+// permission_ask 广播帧一致，按发出顺序排列）
+func (h *Hub) pendingAskFrames() []map[string]any {
+	h.askMu.Lock()
+	ids := make([]string, 0, len(h.asks))
+	for id := range h.asks {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, map[string]any{"type": "permission_ask", "id": id, "request": h.asks[id].req})
+	}
+	h.askMu.Unlock()
+	return out
 }
 
 // serveWS upgrades a request to a WebSocket and runs the client loops until
@@ -342,19 +384,43 @@ func (h *Hub) disconnect(c *client) {
 	_ = c.conn.Close(websocket.StatusGoingAway, "server shutdown")
 }
 
-// writeLoop drains the outbound queue to the socket.
+// writeLoop drains the outbound queue to the socket. Every write and the
+// keepalive ping are deadline-bounded: a peer that stops reading (or dies
+// without a close frame) must not wedge this goroutine or the read loop —
+// on failure the loop exits, cancelling ctx so serveWS's blocked Read
+// returns and disconnect() reclaims the connection.
 func (c *client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
+	ticker := time.NewTicker(time.Duration(wsPingInterval.Load()))
+	defer ticker.Stop()
 	for {
 		select {
 		case <-c.done:
 			return
+		case <-ticker.C:
+			// 保活 ping 探测半开连接：对端不回 pong（含停止读导致写通道
+			// 被 writeFrameMu 卡住）即限时失败，退出并回收连接
+			pctx, pcancel := context.WithTimeout(ctx, time.Duration(wsWriteTimeout.Load()))
+			err := c.conn.Ping(pctx)
+			pcancel()
+			if err != nil {
+				// 对端无响应：跳过关闭握手立即回收（Close 会被阻塞中的
+				// reader 持有的 readMu 卡住 5 秒）
+				_ = c.conn.CloseNow()
+				return
+			}
 		case data, ok := <-c.send:
 			if !ok {
 				_ = c.conn.Close(websocket.StatusGoingAway, "slow client")
 				return
 			}
-			if err := c.conn.Write(ctx, websocket.MessageText, data); err != nil {
+			// 单帧限时写：对端停止读时不至永久阻塞（泄漏 goroutine 与连接）
+			wctx, wcancel := context.WithTimeout(ctx, time.Duration(wsWriteTimeout.Load()))
+			err := c.conn.Write(wctx, websocket.MessageText, data)
+			wcancel()
+			if err != nil {
+				// 对端停止读已证实：跳过关闭握手立即回收
+				_ = c.conn.CloseNow()
 				return
 			}
 		}

@@ -110,16 +110,61 @@ func LoadCustomModels(modelsFile string) ([]*ai.Model, error) {
 	return custom, nil
 }
 
-// SaveCustomModels 写回自定义模型文件（扁平数组；空列表落盘为 []）
+// SaveCustomModels 写回自定义模型文件（扁平数组；空列表落盘为 []）。
+// 落盘前按 provider+id 去重、保留首次出现：0.11 及更早的编辑是纯追加，
+// 遗留的同 key 重复条目在此一并治愈，否则编辑替换第一条后旧条目仍在，
+// 界面上看仍是「加了新的没改原的」。
 func SaveCustomModels(modelsFile string, models []*ai.Model) error {
-	if models == nil {
-		models = []*ai.Model{}
+	dedup := make([]*ai.Model, 0, len(models))
+	seen := map[string]bool{}
+	for _, m := range models {
+		if m == nil {
+			continue
+		}
+		key := m.Provider + "/" + m.ID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		dedup = append(dedup, m)
 	}
-	data, err := json.MarshalIndent(models, "", "  ")
+	if len(dedup) == 0 {
+		dedup = []*ai.Model{}
+	}
+	data, err := json.MarshalIndent(dedup, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(modelsFile, append(data, '\n'), 0o644)
+}
+
+// MergeModelEdit 编辑保存合并：请求未携带的扩展字段回填旧值。配置 UI 只覆盖
+// 基础字段，整条替换会把 models.json 里手工配置的 headers（网关鉴权）、
+// sessionAffinity、impersonate、thinkingLevelMap、cost 静默清空——编辑后模型
+// 反而用不了。旧条目缺失（新建）时原样返回。
+func MergeModelEdit(old, next *ai.Model) *ai.Model {
+	if old == nil || next == nil {
+		return next
+	}
+	if next.Name == "" {
+		next.Name = old.Name
+	}
+	if next.Headers == nil {
+		next.Headers = old.Headers
+	}
+	if next.SessionAffinity == "" {
+		next.SessionAffinity = old.SessionAffinity
+	}
+	if next.Impersonate == "" {
+		next.Impersonate = old.Impersonate
+	}
+	if next.ThinkingLevelMap == nil {
+		next.ThinkingLevelMap = old.ThinkingLevelMap
+	}
+	if next.Cost == (ai.ModelCost{}) {
+		next.Cost = old.Cost
+	}
+	return next
 }
 
 // builtinProviders 内置 provider 目录（EnvKeys 供引导页展示环境变量名）。

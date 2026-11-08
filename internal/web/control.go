@@ -12,6 +12,7 @@ import (
 type sessionControl struct {
 	active  *coding.AgentSession // shared active instance (nil until first open)
 	readers map[string]bool      // consumers viewing this session
+	order   []string             // 读者到达顺序（幽灵释放后提升最老活跃窗口用）
 	owner   string               // write-holder; "" = uncontended
 	waiters []string             // FIFO queue for the next ownership
 }
@@ -31,6 +32,29 @@ type controlTable struct {
 
 func newControlTable() *controlTable {
 	return &controlTable{sessions: map[string]*sessionControl{}}
+}
+
+// addReader 按到达顺序登记读者（重复登记不改顺序）
+func (c *sessionControl) addReader(id string) {
+	if c.readers[id] {
+		return
+	}
+	c.readers[id] = true
+	c.order = append(c.order, id)
+}
+
+// removeReader 摘除读者登记（含到达顺序）
+func (c *sessionControl) removeReader(id string) {
+	if !c.readers[id] {
+		return
+	}
+	delete(c.readers, id)
+	for i, r := range c.order {
+		if r == id {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // SetOnTransfer installs the ownership-change notification hook. It is called
@@ -54,7 +78,9 @@ func (t *controlTable) SetLiveness(fn func(consumer string) bool) {
 
 // dropStale 清理失去活跃连接的幽灵消费者：断开（刷新换 clientID、关闭标签页）
 // 不会通知控制表，残留的 owner 会让后续查看者永远只读且 claim 只能排队。
-// owner 让位后按 FIFO 提升仍活跃的排队者，waiters/readers 里的死项一并剔除。
+// owner 让位后按 FIFO 提升仍活跃的排队者，无排队者时提升最老的活跃只读
+// 窗口（在场窗口不该干等下一次 open/acquire 才拿回写权），waiters/readers
+// 里的死项一并剔除。
 func (t *controlTable) dropStale(key string, c *sessionControl) {
 	if t.live == nil {
 		return
@@ -66,7 +92,7 @@ func (t *controlTable) dropStale(key string, c *sessionControl) {
 	}
 	for r := range c.readers {
 		if !t.live(r) {
-			delete(c.readers, r)
+			c.removeReader(r)
 		}
 	}
 	if c.owner != "" && !t.live(c.owner) {
@@ -79,6 +105,17 @@ func (t *controlTable) dropStale(key string, c *sessionControl) {
 				break
 			}
 			c.waiters = c.waiters[1:]
+		}
+		// 无活跃排队者时提升最老的活跃只读窗口，并经 onTransfer 广播，
+		// 让它当场翻转为可写（否则重连窗口一直 403，直到下次刷新）
+		if c.owner == "" {
+			for _, r := range c.order {
+				if t.live(r) {
+					c.owner = r
+					logx.Infof("[web] promoted live viewer %q to owner of %s after stale release", r, filepath.Base(key))
+					break
+				}
+			}
 		}
 		// 提升 owner 后广播一次：被提升窗口的 UI 停在"排队中"，
 		// 不广播它不知道自己已拿到写权（与 takeover 的通知口径一致）
@@ -133,7 +170,7 @@ func (t *controlTable) open(key, consumer string, create func() (*coding.AgentSe
 	// 先清幽灵再注册自己：消费者此刻可能尚未建立 WS 连接（REST 先行），
 	// 放在注册之后会把自己一并清掉
 	t.dropStale(key, c)
-	c.readers[consumer] = true
+	c.addReader(consumer)
 	if c.owner == "" {
 		c.owner = consumer
 	}
@@ -154,7 +191,7 @@ func (t *controlTable) acquire(key, consumer string) (owned bool, queued bool) {
 		return false, false
 	}
 	t.dropStale(key, c)
-	c.readers[consumer] = true // claim 即在看，补注册以防自己被 dropStale 清掉
+	c.addReader(consumer) // claim 即在看，补注册以防自己被 dropStale 清掉
 	if c.owner == "" {
 		c.owner = consumer
 		return true, false
@@ -190,7 +227,7 @@ func (t *controlTable) release(key, consumer string) {
 		return
 	}
 	wasOwner := c.owner == consumer
-	delete(c.readers, consumer)
+	c.removeReader(consumer)
 	for i, w := range c.waiters {
 		if w == consumer {
 			c.waiters = append(c.waiters[:i], c.waiters[i+1:]...)

@@ -318,7 +318,7 @@ func (s *Server) applyModelsConfig(w http.ResponseWriter, b Backend, meta *uploa
 	}
 	reloaded := true
 	reloadErr := ""
-	if err := b.ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(b); err != nil {
 		reloaded = false
 		reloadErr = err.Error()
 	}
@@ -377,7 +377,7 @@ func (s *Server) applySkillsZip(w http.ResponseWriter, b Backend, meta *uploads.
 	s.applyMu.Unlock()
 	reloaded := true
 	reloadErr := ""
-	if err := b.ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(b); err != nil {
 		reloaded = false
 		reloadErr = err.Error()
 	}
@@ -414,7 +414,7 @@ func (s *Server) applyPermissionsConfig(w http.ResponseWriter, b Backend, meta *
 	}
 	reloaded := true
 	reloadErr := ""
-	if err := b.ReloadConfig(); err != nil {
+	if err := s.reloadAfterConfigWrite(b); err != nil {
 		reloaded = false
 		reloadErr = err.Error()
 	}

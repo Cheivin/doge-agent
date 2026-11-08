@@ -385,6 +385,8 @@ button, summary, select, textarea, input,
   cursor: pointer;
 }
 .sb-status #takeover-btn:hover { background: var(--danger); color: #fff; }
+/* 粘性错误提示（setStatusText 第二参）：危险色，不被 5s 轮询的「就绪」覆盖 */
+#sb-status-text.error { color: var(--danger); }
 .sb-foot #settings-btn {
   width: 100%;
   text-align: left;
@@ -1255,7 +1257,7 @@ pre.remote-task-out.error { border-left-color: var(--danger); }
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 50;
+  z-index: 400; /* 高于 #setup(300)/.newtask(55)：权限/提问弹窗不被新建窗口或向导盖住 */
   animation: fade-in 0.15s ease both;
 }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
