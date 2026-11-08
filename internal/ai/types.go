@@ -63,6 +63,7 @@ type ContentBlock struct {
 	ToolCallID       string
 	ToolName         string
 	Arguments        map[string]any
+	RawArgs          string // 适配器解析失败时保留的原始参数串，非空即参数 JSON 非法
 	ThoughtSignature string
 }
 
@@ -174,13 +175,12 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 
 // Usage 追踪 token 使用量和费用
 type Usage struct {
-	Input        int `json:"input"`
-	Output       int `json:"output"`
-	CacheRead    int `json:"cacheRead"`
-	CacheWrite   int `json:"cacheWrite"`
-	CacheWrite1h int `json:"cacheWrite1h,omitempty"`
-	Reasoning    int `json:"reasoning,omitempty"`
-	TotalTokens  int `json:"totalTokens"`
+	Input       int `json:"input"`
+	Output      int `json:"output"`
+	CacheRead   int `json:"cacheRead"`
+	CacheWrite  int `json:"cacheWrite"`
+	Reasoning   int `json:"reasoning,omitempty"`
+	TotalTokens int `json:"totalTokens"`
 
 	Cost UsageCost `json:"cost"`
 }

@@ -132,6 +132,44 @@ func typesOf(events []AssistantMessageEvent) []string {
 	return out
 }
 
+// TestOpenAIResponsesMalformedToolArgs：参数分片拼成非法 JSON 时保留原始串
+// 标记（RawArgs），不得静默用空参数放行。
+func TestOpenAIResponsesMalformedToolArgs(t *testing.T) {
+	srv := newResponsesServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w,
+			sseEvent("response.created", `{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`),
+			sseEvent("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"in_progress","name":"bash","arguments":"","call_id":"call_1"}}`),
+			sseEvent("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"command\":"}`),
+			sseEvent("response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"\"ls\""}`),
+			sseEvent("response.function_call_arguments.done", `{"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":1,"arguments":"{\"command\":\"ls\""}`),
+			sseEvent("response.completed", `{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`),
+		)
+	})
+	defer srv.Close()
+
+	model := &Model{ID: "gpt-5.2", API: APIOpenAIResponses, Provider: "openai", BaseURL: srv.URL}
+	stream := openAIResponsesStream(model, &Context{Messages: []*Message{NewUserTextMessage("hi")}}, &StreamOptions{APIKey: "sk-test"})
+	_, msg, err := collectStream(stream)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	var tc *ContentBlock
+	for i := range msg.Content {
+		if msg.Content[i].Type == ContentTypeToolCall {
+			tc = &msg.Content[i]
+		}
+	}
+	if tc == nil {
+		t.Fatalf("no tool call block: %+v", msg.Content)
+	}
+	if tc.RawArgs == "" {
+		t.Fatal("malformed arguments not marked via RawArgs")
+	}
+	if _, err := ParseToolArguments(tc.RawArgs); err == nil {
+		t.Fatalf("RawArgs %q should not parse as JSON", tc.RawArgs)
+	}
+}
+
 func TestOpenAIResponsesRequestShape(t *testing.T) {
 	var gotBody map[string]any
 	var gotAuth string

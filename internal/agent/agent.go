@@ -183,12 +183,6 @@ func (a *Agent) FollowUp(m *ai.Message) {
 	a.followUpQ.Enqueue(m)
 }
 
-// ClearQueues 清空所有队列
-func (a *Agent) ClearQueues() {
-	a.steeringQ.Clear()
-	a.followUpQ.Clear()
-}
-
 // HasQueuedMessages 报告是否有队列消息
 func (a *Agent) HasQueuedMessages() bool {
 	return a.steeringQ.HasItems() || a.followUpQ.HasItems()

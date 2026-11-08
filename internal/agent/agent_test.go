@@ -2,6 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -763,5 +767,275 @@ func TestSetModelAffectsNextRun(t *testing.T) {
 	a.SetThinkingLevel("high")
 	if cfg2 := a.loopConfig(); cfg2.thinkingLevel != "high" {
 		t.Fatalf("want thinking high, got %v", cfg2.thinkingLevel)
+	}
+}
+
+// TestAgentListenerErrorUnwedgesStream：监听器在首个文本增量报错时，Prompt
+// 必须在有限时间内返回该错误。回归：小缓冲下生产者卡死在 Push 上，Prompt
+// 永久阻塞、HTTP 流持续烧 token。
+func TestAgentListenerErrorUnwedgesStream(t *testing.T) {
+	// 小缓冲 + 大量增量：监听器停止消费后生产者必然卡在 Push 上。
+	streamFn := func(model *ai.Model, ctx *ai.Context, opts *ai.StreamOptions) *ai.EventStream {
+		s := ai.NewEventStream(2)
+		go func() {
+			partial := ai.NewAssistantMessage(model.API, model.Provider, model.ID)
+			s.Push(ai.AssistantMessageEvent{Type: ai.EventStart, Partial: partial.Clone()})
+			for i := 0; i < 64; i++ {
+				partial.Content = append(partial.Content, ai.ContentBlock{Type: ai.ContentTypeText, Text: "x"})
+				s.Push(ai.AssistantMessageEvent{Type: ai.EventTextDelta, Partial: partial.Clone(), Delta: "x"})
+			}
+			final := partial.Clone()
+			final.StopReason = ai.StopReasonStop
+			s.End(final)
+		}()
+		return s
+	}
+	a := NewAgent(AgentOptions{Model: testModel(), StreamFn: streamFn})
+	a.Subscribe(func(ev AgentEvent) error {
+		if ev.Type == EventMessageUpdate && ev.AssistantMessageEvent != nil && ev.AssistantMessageEvent.Type == ai.EventTextDelta {
+			return errors.New("listener boom")
+		}
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- a.Prompt("go") }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "listener boom") {
+			t.Fatalf("prompt err = %v, want the listener error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("prompt wedged: listener error never surfaced (producer stuck in Push)")
+	}
+}
+
+// TestAgentToolBatchFailureSurfacesError：工具批次内事件发射失败必须以错误
+// 结束运行，而不是发出干净的 turn_end/agent_end 让 Prompt 返回 nil。
+func TestAgentToolBatchFailureSurfacesError(t *testing.T) {
+	for _, mode := range []ToolExecutionMode{ToolExecutionParallel, ToolExecutionSequential} {
+		t.Run(string(mode), func(t *testing.T) {
+			executed := 0
+			tool := &AgentTool{
+				Name: "bash", Description: "x",
+				Parameters: map[string]any{"type": "object"},
+				Execute: func(toolCallID string, params map[string]any, ctx context.Context, onUpdate AgentToolUpdateCallback) (*AgentToolResult, error) {
+					executed++
+					return &AgentToolResult{Content: []ai.ContentBlock{ai.TextBlock("ran")}}, nil
+				},
+			}
+			a := NewAgent(AgentOptions{
+				Model:         testModel(),
+				Tools:         []*AgentTool{tool},
+				ToolExecution: mode,
+				StreamFn: fakeStream(
+					func(call int, ctx *ai.Context) *ai.Message {
+						return toolCallStop("c1", "bash", map[string]any{})
+					},
+					func(call int, ctx *ai.Context) *ai.Message {
+						t.Error("a second LLM turn must not run after a batch failure")
+						return textStop("unreachable")
+					},
+				),
+			})
+			rec := collectEvents(a)
+			a.Subscribe(func(ev AgentEvent) error {
+				if ev.Type == EventToolExecutionStart {
+					return errors.New("persistence boom")
+				}
+				return nil
+			})
+			done := make(chan error, 1)
+			go func() { done <- a.Prompt("go") }()
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "persistence boom") {
+					t.Fatalf("prompt err = %v, want the batch failure", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("prompt did not surface the tool batch failure")
+			}
+			if executed != 0 {
+				t.Errorf("tool executed %d times despite the batch failure", executed)
+			}
+			// 失败的轮次仍以 turn_end 收口，事件流可见
+			if len(rec.events) == 0 {
+				t.Fatal("no events recorded")
+			}
+			if last := rec.events[len(rec.events)-1]; last.Type != EventTurnEnd {
+				t.Errorf("last event = %s, want turn_end", last.Type)
+			}
+		})
+	}
+}
+
+// TestAgentInvalidRawArgsNotExecuted：适配器标记的非法参数调用（RawArgs）
+// 不执行，产出命名原因的错误结果，轮次照常继续。
+func TestAgentInvalidRawArgsNotExecuted(t *testing.T) {
+	for _, mode := range []ToolExecutionMode{ToolExecutionParallel, ToolExecutionSequential} {
+		t.Run(string(mode), func(t *testing.T) {
+			executed := 0
+			tool := &AgentTool{
+				Name: "bash", Description: "x",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"command": map[string]any{"type": "string"}},
+				},
+				Execute: func(toolCallID string, params map[string]any, ctx context.Context, onUpdate AgentToolUpdateCallback) (*AgentToolResult, error) {
+					executed++
+					return &AgentToolResult{Content: []ai.ContentBlock{ai.TextBlock("ran")}}, nil
+				},
+			}
+			bad := ai.ToolCallBlock("c_bad", "bash", map[string]any{})
+			bad.RawArgs = `{"command": "ls"` // 非法 JSON
+			a := NewAgent(AgentOptions{
+				Model:         testModel(),
+				Tools:         []*AgentTool{tool},
+				ToolExecution: mode,
+				StreamFn: fakeStream(
+					func(call int, ctx *ai.Context) *ai.Message {
+						m := &ai.Message{Role: ai.RoleAssistant, StopReason: ai.StopReasonToolUse, Timestamp: time.Now().UnixMilli()}
+						m.Content = []ai.ContentBlock{bad}
+						return m
+					},
+					func(call int, ctx *ai.Context) *ai.Message {
+						last := ctx.Messages[len(ctx.Messages)-1]
+						if last.Role != ai.RoleToolResult || !last.IsError || !strings.Contains(last.Text(), "arguments json invalid") {
+							t.Errorf("second turn did not receive the invalid-arguments error result: %+v", last)
+						}
+						return textStop("recovered")
+					},
+				),
+			})
+			if err := a.Prompt("go"); err != nil {
+				t.Fatalf("prompt: %v", err)
+			}
+			if executed != 0 {
+				t.Errorf("tool executed %d times with invalid arguments", executed)
+			}
+		})
+	}
+}
+
+// TestAgentAdapterInvalidToolCallJSONEndToEnd：三个适配器真实流式拼出非法
+// 参数 JSON 时，工具不得执行且产出命名原因的错误结果。
+func TestAgentAdapterInvalidToolCallJSONEndToEnd(t *testing.T) {
+	for _, api := range []string{ai.APIOpenAIResponses, ai.APIOpenAICompletions, ai.APIAnthropicMessages} {
+		t.Run(api, func(t *testing.T) {
+			var mu sync.Mutex
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				n := calls
+				calls++
+				mu.Unlock()
+				w.Header().Set("Content-Type", "text/event-stream")
+				switch api {
+				case ai.APIOpenAIResponses:
+					if n == 0 {
+						writeAgentSSE(w,
+							"response.created", `{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+							"response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","name":"bash","arguments":"","call_id":"call_1"}}`,
+							"response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"command\":"}`,
+							"response.function_call_arguments.delta", `{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"\"ls\""}`,
+							"response.function_call_arguments.done", `{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"command\":\"ls\""}`,
+							"response.completed", `{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+						)
+						return
+					}
+					writeAgentSSE(w,
+						"response.created", `{"type":"response.created","response":{"id":"resp_2","status":"in_progress"}}`,
+						"response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_2","type":"message","role":"assistant","content":[]}}`,
+						"response.content_part.added", `{"type":"response.content_part.added","item_id":"msg_2","part":{"type":"output_text"}}`,
+						"response.output_text.delta", `{"type":"response.output_text.delta","item_id":"msg_2","delta":"recovered"}`,
+						"response.completed", `{"type":"response.completed","response":{"id":"resp_2","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+					)
+				case ai.APIOpenAICompletions:
+					if n == 0 {
+						writeAgentSSEData(w,
+							`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+							`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}`,
+							`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\""}}]}}]}`,
+							`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+							`[DONE]`,
+						)
+						return
+					}
+					writeAgentSSEData(w,
+						`{"choices":[{"delta":{"content":"recovered"}}]}`,
+						`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+						`[DONE]`,
+					)
+				case ai.APIAnthropicMessages:
+					if n == 0 {
+						writeAgentSSE(w,
+							"message_start", `{"type":"message_start","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":0}}}`,
+							"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}`,
+							"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}`,
+							"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\""}}`,
+							"content_block_stop", `{"type":"content_block_stop","index":0}`,
+							"message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}`,
+							"message_stop", `{"type":"message_stop"}`,
+						)
+						return
+					}
+					writeAgentSSE(w,
+						"message_start", `{"type":"message_start","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":0}}}`,
+						"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+						"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"recovered"}}`,
+						"content_block_stop", `{"type":"content_block_stop","index":0}`,
+						"message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+						"message_stop", `{"type":"message_stop"}`,
+					)
+				}
+			}))
+			defer srv.Close()
+
+			executed := 0
+			tool := &AgentTool{
+				Name: "bash", Description: "x",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"command": map[string]any{"type": "string"}},
+				},
+				Execute: func(toolCallID string, params map[string]any, ctx context.Context, onUpdate AgentToolUpdateCallback) (*AgentToolResult, error) {
+					executed++
+					return &AgentToolResult{Content: []ai.ContentBlock{ai.TextBlock("ran")}}, nil
+				},
+			}
+			model := &ai.Model{ID: "test-model", API: api, Provider: "test", BaseURL: srv.URL}
+			a := NewAgent(AgentOptions{Model: model, Tools: []*AgentTool{tool}, StreamFn: ai.DefaultStream})
+			if err := a.Prompt("go"); err != nil {
+				t.Fatalf("prompt: %v", err)
+			}
+			if executed != 0 {
+				t.Errorf("tool executed %d times with malformed arguments", executed)
+			}
+			var errResult *ai.Message
+			for _, m := range a.State().Messages {
+				if m.Role == ai.RoleToolResult && m.IsError {
+					errResult = m
+				}
+			}
+			if errResult == nil {
+				t.Fatal("no error tool result for the malformed call")
+			}
+			if !strings.Contains(errResult.Text(), "arguments json invalid") {
+				t.Errorf("error result %q does not name the invalid-arguments reason", errResult.Text())
+			}
+		})
+	}
+}
+
+// writeAgentSSE 写具名 SSE 事件流
+func writeAgentSSE(w http.ResponseWriter, pairs ...string) {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", pairs[i], pairs[i+1])
+	}
+}
+
+// writeAgentSSEData 写仅 data 行的 SSE 事件流
+func writeAgentSSEData(w http.ResponseWriter, datas ...string) {
+	for _, d := range datas {
+		fmt.Fprintf(w, "data: %s\n\n", d)
 	}
 }

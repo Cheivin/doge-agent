@@ -62,6 +62,43 @@ func TestOpenAICompletionsStream(t *testing.T) {
 	}
 }
 
+// TestOpenAICompletionsMalformedToolArgs：参数分片拼成非法 JSON 时保留原始
+// 串标记（RawArgs），不得静默用空参数放行。
+func TestOpenAICompletionsMalformedToolArgs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}`,
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\""}}]}}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`data: [DONE]`,
+		)
+	}))
+	defer srv.Close()
+
+	model := &Model{ID: "deepseek-chat", API: APIOpenAICompletions, Provider: "deepseek", BaseURL: srv.URL}
+	stream := openAICompletionsStream(model, &Context{Messages: []*Message{NewUserTextMessage("hi")}}, &StreamOptions{APIKey: "sk-test"})
+	_, msg, err := collectStream(stream)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	var tc *ContentBlock
+	for i := range msg.Content {
+		if msg.Content[i].Type == ContentTypeToolCall {
+			tc = &msg.Content[i]
+		}
+	}
+	if tc == nil {
+		t.Fatalf("no tool call block: %+v", msg.Content)
+	}
+	if tc.RawArgs == "" {
+		t.Fatal("malformed arguments not marked via RawArgs")
+	}
+	if _, err := ParseToolArguments(tc.RawArgs); err == nil {
+		t.Fatalf("RawArgs %q should not parse as JSON", tc.RawArgs)
+	}
+}
+
 func TestOpenAICompletionsRequestShape(t *testing.T) {
 	var gotBody map[string]any
 	var gotAuth string

@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -111,6 +112,61 @@ func TestEventStreamPushAfterEnd(t *testing.T) {
 	result, err := s.Result()
 	if err != nil || result != msg {
 		t.Fatalf("result = %v, %v", result, err)
+	}
+}
+
+// TestEventStreamConsumerCloseUnblocksProducer：消费侧 Close 必须解除卡在
+// Push 上的生产者，且 Result 返回 ErrStreamClosed 哨兵。
+func TestEventStreamConsumerCloseUnblocksProducer(t *testing.T) {
+	s := NewEventStream(1)
+	partial := NewAssistantMessage("", "", "")
+	s.Push(AssistantMessageEvent{Type: EventStart, Partial: partial}) // 占满缓冲
+	pushed := make(chan struct{})
+	go func() {
+		s.Push(AssistantMessageEvent{Type: EventTextDelta, Partial: partial}) // 缓冲已满，阻塞
+		close(pushed)
+	}()
+	time.Sleep(20 * time.Millisecond) // 等生产者卡进 Push
+	s.Close()
+	select {
+	case <-pushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not unblock the producer parked in Push")
+	}
+	if _, err := s.Result(); !errors.Is(err, ErrStreamClosed) {
+		t.Fatalf("result err = %v, want ErrStreamClosed", err)
+	}
+	s.Close() // 幂等：重复 Close 不得 panic
+}
+
+// TestEventStreamCloseEndAnyOrder：Close 与 End 任意顺序、任意次数组合都
+// 安全，End 仍能记录最终消息。
+func TestEventStreamCloseEndAnyOrder(t *testing.T) {
+	msg := NewAssistantMessage("", "", "")
+
+	// Close 后 End：End 的最终消息仍由 Result 返回
+	s1 := NewEventStream(1)
+	s1.Close()
+	s1.Close()
+	s1.End(msg)
+	if got, err := s1.Result(); err != nil || got != msg {
+		t.Fatalf("End after Close: result = %v, %v; want msg, nil", got, err)
+	}
+
+	// End 后 Close：不得 panic，Result 仍返回消息
+	s2 := NewEventStream(1)
+	s2.End(msg)
+	s2.Close()
+	if got, err := s2.Result(); err != nil || got != msg {
+		t.Fatalf("Close after End: result = %v, %v; want msg, nil", got, err)
+	}
+
+	// 仅 Close：Range 立即返回，不阻塞
+	s3 := NewEventStream(1)
+	s3.Push(AssistantMessageEvent{Type: EventStart, Partial: msg})
+	s3.Close()
+	if err := s3.Range(func(AssistantMessageEvent) error { return nil }); err != nil {
+		t.Fatalf("range after close: %v", err)
 	}
 }
 

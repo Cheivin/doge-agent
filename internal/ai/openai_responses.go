@@ -604,6 +604,7 @@ func (h *responsesHandler) finalizeToolCall(data []byte) {
 	args, err := parseArguments(raw)
 	if err != nil {
 		h.partial.Content[idx].Arguments = map[string]any{}
+		h.partial.Content[idx].RawArgs = raw // 标记参数非法，执行前由 agent 校验拒绝
 	} else {
 		h.partial.Content[idx].Arguments = args
 	}

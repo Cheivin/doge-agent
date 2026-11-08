@@ -145,9 +145,14 @@ func resolveAnthropicThinking(model *Model, opts *StreamOptions) int {
 
 // convertAnthropicMessages converts unified messages into Messages API
 // messages. Tool results become user messages with tool_result blocks.
+//
+// Adjacent tool results are merged into a single user message with multiple
+// tool_result blocks, mirroring convertResponsesInput: some gateways reject
+// one user message per tool result.
 func convertAnthropicMessages(messages []*Message) []any {
 	out := make([]any, 0, len(messages))
-	for _, m := range messages {
+	for i := 0; i < len(messages); i++ {
+		m := messages[i]
 		switch m.Role {
 		case RoleUser:
 			out = append(out, map[string]any{"role": "user", "content": convertAnthropicUserContent(m.Content)})
@@ -180,15 +185,18 @@ func convertAnthropicMessages(messages []*Message) []any {
 			}
 			out = append(out, map[string]any{"role": "assistant", "content": blocks})
 		case RoleToolResult:
-			content := convertAnthropicToolResult(m)
-			out = append(out, map[string]any{
-				"role": "user",
-				"content": []any{map[string]any{
+			blocks := []any{}
+			for i < len(messages) && messages[i].Role == RoleToolResult {
+				tr := messages[i]
+				blocks = append(blocks, map[string]any{
 					"type":        "tool_result",
-					"tool_use_id": m.ToolCallID,
-					"content":     content,
-				}},
-			})
+					"tool_use_id": tr.ToolCallID,
+					"content":     convertAnthropicToolResult(tr),
+				})
+				i++
+			}
+			i-- // the loop increments past the last tool result
+			out = append(out, map[string]any{"role": "user", "content": blocks})
 		}
 	}
 	return out
@@ -256,8 +264,6 @@ type anthropicHandler struct {
 	argsJSON map[int]string
 	// content index → initial tool input from content_block_start
 	initialInput map[int]map[string]any
-	// content index of thinking blocks → signature
-	thinkingSig map[int]string
 	// accums holds the per-content-block text accumulators so streaming text
 	// and thinking appends don't re-copy the whole block on every delta.
 	accums map[int]*textAccum
@@ -438,6 +444,7 @@ func (h *anthropicHandler) handleLocked(ev SSEEvent) error {
 		case ContentTypeToolCall:
 			args, err := parseArguments(h.argsJSON[r.Index])
 			if err != nil {
+				h.partial.Content[r.Index].RawArgs = h.argsJSON[r.Index] // 标记参数非法，执行前由 agent 校验拒绝
 				if init := h.initialInput[r.Index]; init != nil {
 					args = init
 				} else {
@@ -517,6 +524,7 @@ func (h *anthropicHandler) finalizeToolArgs() {
 		}
 		args, err := parseArguments(h.argsJSON[i])
 		if err != nil {
+			h.partial.Content[i].RawArgs = h.argsJSON[i] // 标记参数非法，执行前由 agent 校验拒绝
 			if init := h.initialInput[i]; init != nil {
 				args = init
 			} else {

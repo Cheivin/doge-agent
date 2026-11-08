@@ -457,6 +457,7 @@ func (h *completionsHandler) finalizeToolCalls() {
 		}
 		args, err := parseArguments(h.argsJSON[idx])
 		if err != nil {
+			block.RawArgs = h.argsJSON[idx] // 标记参数非法，执行前由 agent 校验拒绝
 			args = map[string]any{}
 		}
 		block.Arguments = args

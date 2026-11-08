@@ -166,6 +166,14 @@ func runLoopBody(current *AgentContext, newMessages []*ai.Message, config *loopC
 					current.Messages = append(current.Messages, r)
 					newMessages = append(newMessages, r)
 				}
+				if executed.err != nil {
+					// 工具批次失败：结束本轮并把错误上抛，不能静默当成功
+					logx.Warnf("[agent] tool batch failed: %v", executed.err)
+					if err := emit(AgentEvent{Type: EventTurnEnd, Message: message, ToolResults: toolResults}); err != nil {
+						return err
+					}
+					return executed.err
+				}
 			}
 
 			if err := emit(AgentEvent{Type: EventTurnEnd, Message: message, ToolResults: toolResults}); err != nil {
@@ -265,10 +273,16 @@ func streamAssistantResponse(current *AgentContext, config *loopConfig, emit fun
 	})
 	if err != nil && !errors.Is(err, errStopStream) {
 		streamErr = err
+		// 消费侧中止：关闭流解除生产者 Push 阻塞，否则生产者永久卡死
+		stream.Close()
 	}
 
 	final, resultErr := stream.Result()
 	if resultErr != nil {
+		if streamErr != nil && errors.Is(resultErr, ai.ErrStreamClosed) {
+			// 流被本方关闭：监听器错误优先于关闭哨兵
+			return aiMessageError(streamErr.Error()), streamErr
+		}
 		return aiMessageError("stream failed: " + resultErr.Error()), nil
 	}
 	if streamErr != nil {
@@ -296,6 +310,8 @@ var errStopStream = errors.New("stop stream iteration")
 type toolBatch struct {
 	messages  []*ai.Message
 	terminate bool
+	// err 批次内事件发射或持久化失败：运行必须中止并向上返回，不能当干净成功收尾
+	err error
 }
 
 // executeToolCalls prepares and executes the tool calls of an assistant
@@ -328,7 +344,7 @@ func executeToolCallsSequential(current *AgentContext, assistant *ai.Message, ca
 	var finalized []finalizedToolCall
 	for _, call := range calls {
 		if err := emit(AgentEvent{Type: EventToolExecutionStart, ToolCallID: call.ToolCallID, ToolName: call.ToolName, Args: call.Arguments}); err != nil {
-			return toolBatch{messages: messages, terminate: true}
+			return toolBatch{messages: messages, terminate: true, err: err}
 		}
 		// A steering message queued while the previous tool ran skips the
 		// remaining tools (mirroring the parallel batch interrupt).
@@ -338,19 +354,19 @@ func executeToolCallsSequential(current *AgentContext, assistant *ai.Message, ca
 			finalized = append(finalized, f)
 			tr := toolResultMessage(f)
 			if err := emitMessagePair(emit, tr); err != nil {
-				return toolBatch{messages: messages, terminate: true}
+				return toolBatch{messages: messages, terminate: true, err: err}
 			}
 			messages = append(messages, tr)
 			continue
 		}
 		f, err := runOneToolCall(current, assistant, call, config, emit, ctx)
 		if err != nil {
-			return toolBatch{messages: messages, terminate: true}
+			return toolBatch{messages: messages, terminate: true, err: err}
 		}
 		finalized = append(finalized, f)
 		tr := toolResultMessage(f)
 		if err := emitMessagePair(emit, tr); err != nil {
-			return toolBatch{messages: messages, terminate: true}
+			return toolBatch{messages: messages, terminate: true, err: err}
 		}
 		messages = append(messages, tr)
 		if ctx.Err() != nil {
@@ -375,15 +391,15 @@ func executeToolCallsParallel(current *AgentContext, assistant *ai.Message, call
 	entries := make([]entry, 0, len(calls))
 	for _, call := range calls {
 		if err := emit(AgentEvent{Type: EventToolExecutionStart, ToolCallID: call.ToolCallID, ToolName: call.ToolName, Args: call.Arguments}); err != nil {
-			return toolBatch{terminate: true}
+			return toolBatch{terminate: true, err: err}
 		}
 		prepared, immediate, err := prepareToolCall(current, assistant, call, config, ctx)
 		if err != nil {
-			return toolBatch{terminate: true}
+			return toolBatch{terminate: true, err: err}
 		}
 		if immediate != nil {
 			if err := emitToolExecutionEnd(*immediate, emit); err != nil {
-				return toolBatch{terminate: true}
+				return toolBatch{terminate: true, err: err}
 			}
 			f := *immediate
 			entries = append(entries, entry{call: call, finalize: func(context.Context) (finalizedToolCall, error) { return f, nil }})
@@ -509,7 +525,7 @@ waitLoop:
 		finalized = append(finalized, f)
 		tr := toolResultMessage(f)
 		if err := emitMessagePair(emit, tr); err != nil {
-			return toolBatch{messages: messages, terminate: true}
+			return toolBatch{messages: messages, terminate: true, err: err}
 		}
 		messages = append(messages, tr)
 	}
@@ -621,6 +637,21 @@ type preparedToolCall struct {
 // beforeToolCall hook. Returns (prepared, nil) for execution, or
 // (nil, immediate) for immediate outcomes (blocked, invalid, missing tool).
 func prepareToolCall(current *AgentContext, assistant *ai.Message, call ai.ContentBlock, config *loopConfig, ctx context.Context) (*preparedToolCall, *finalizedToolCall, error) {
+	// 参数 JSON 非法：适配器解析失败时保留原始串标记，绝不带空参数执行
+	if call.RawArgs != "" {
+		_, parseErr := ai.ParseToolArguments(call.RawArgs)
+		reason := "arguments json invalid"
+		if parseErr != nil {
+			reason = "arguments json invalid: " + parseErr.Error()
+		}
+		logx.Warnf("[agent] tool %s %s", call.ToolName, reason)
+		return nil, &finalizedToolCall{
+			toolCall: call,
+			result: &AgentToolResult{Content: []ai.ContentBlock{ai.TextBlock(
+				`Tool call "` + call.ToolName + `" was not executed: ` + reason + `. Re-issue the tool call with complete valid JSON arguments.`)}},
+			isError: true,
+		}, nil
+	}
 	tool := findTool(current.Tools, call.ToolName)
 	if tool == nil {
 		logx.Warnf("[agent] tool %s not found", call.ToolName)

@@ -220,3 +220,83 @@ func TestAnthropicLengthStop(t *testing.T) {
 		t.Errorf("stop reason = %q, want length", msg.StopReason)
 	}
 }
+
+// TestAnthropicMalformedToolArgs：input_json_delta 分片拼成非法 JSON 时保留
+// 原始串标记（RawArgs），不得静默用空参数放行。
+func TestAnthropicMalformedToolArgs(t *testing.T) {
+	srv := newAnthropicServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w,
+			sseEvent("message_start", `{"type":"message_start","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":0}}}`),
+			sseEvent("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}`),
+			sseEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}`),
+			sseEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\""}}`),
+			sseEvent("content_block_stop", `{"type":"content_block_stop","index":0}`),
+			sseEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}`),
+			sseEvent("message_stop", `{"type":"message_stop"}`),
+		)
+	})
+	defer srv.Close()
+
+	model := &Model{ID: "claude-sonnet-4-5", API: APIAnthropicMessages, Provider: "anthropic", BaseURL: srv.URL}
+	stream := anthropicMessagesStream(model, &Context{Messages: []*Message{NewUserTextMessage("hi")}}, &StreamOptions{APIKey: "sk-ant-test"})
+	_, msg, err := collectStream(stream)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	var tc *ContentBlock
+	for i := range msg.Content {
+		if msg.Content[i].Type == ContentTypeToolCall {
+			tc = &msg.Content[i]
+		}
+	}
+	if tc == nil {
+		t.Fatalf("no tool call block: %+v", msg.Content)
+	}
+	if tc.RawArgs == "" {
+		t.Fatal("malformed arguments not marked via RawArgs")
+	}
+	if _, err := ParseToolArguments(tc.RawArgs); err == nil {
+		t.Fatalf("RawArgs %q should not parse as JSON", tc.RawArgs)
+	}
+}
+
+// TestAnthropicConvertMergesAdjacentToolResults：相邻 toolResult 合并为一条
+// user 消息的多个 tool_result 块；被其他消息隔开的保持独立。
+func TestAnthropicConvertMergesAdjacentToolResults(t *testing.T) {
+	asst1 := &Message{Role: RoleAssistant, StopReason: StopReasonToolUse,
+		Content: []ContentBlock{ToolCallBlock("t1", "bash", map[string]any{})}}
+	asst2 := &Message{Role: RoleAssistant, StopReason: StopReasonToolUse,
+		Content: []ContentBlock{ToolCallBlock("t2", "bash", map[string]any{})}}
+	tr1 := &Message{Role: RoleToolResult, ToolCallID: "t1", Content: []ContentBlock{TextBlock("a")}}
+	tr2 := &Message{Role: RoleToolResult, ToolCallID: "t2", Content: []ContentBlock{TextBlock("b")}}
+	tr3 := &Message{Role: RoleToolResult, ToolCallID: "t3", Content: []ContentBlock{TextBlock("c")}}
+
+	msgs := []*Message{
+		NewUserTextMessage("start"),
+		asst1,
+		tr1, tr2, // 相邻：合并为一条 user 消息
+		NewUserTextMessage("mid"),
+		asst2,
+		tr3, // 单条：保持独立
+	}
+	got := convertAnthropicMessages(msgs)
+	if len(got) != 6 {
+		t.Fatalf("converted %d messages, want 6: %v", len(got), got)
+	}
+	merged := got[2].(map[string]any)
+	if merged["role"] != "user" {
+		t.Fatalf("merged role = %v, want user", merged["role"])
+	}
+	blocks := merged["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("merged content = %d blocks, want 2: %v", len(blocks), blocks)
+	}
+	if blocks[0].(map[string]any)["tool_use_id"] != "t1" || blocks[1].(map[string]any)["tool_use_id"] != "t2" {
+		t.Fatalf("merged tool_use_ids mismatch: %v", blocks)
+	}
+	single := got[5].(map[string]any)
+	sb := single["content"].([]any)
+	if len(sb) != 1 || sb[0].(map[string]any)["tool_use_id"] != "t3" {
+		t.Fatalf("non-adjacent tool result must stay separate: %v", single)
+	}
+}

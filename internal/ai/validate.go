@@ -72,6 +72,13 @@ func ValidateToolArguments(tool *Tool, args any) (any, error) {
 	return v, nil
 }
 
+// ParseToolArguments parses a raw tool-call arguments JSON string. An empty
+// string is a valid empty object; callers use it to re-derive the reason a
+// provider's streamed arguments were malformed (see ContentBlock.RawArgs).
+func ParseToolArguments(raw string) (map[string]any, error) {
+	return parseArguments(raw)
+}
+
 func formatValidationError(err error) error {
 	var ve *jsonschema.ValidationError
 	if !errors.As(err, &ve) {

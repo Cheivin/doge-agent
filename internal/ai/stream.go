@@ -62,6 +62,10 @@ func ErrorEvent(msg *Message) AssistantMessageEvent {
 	}
 }
 
+// ErrStreamClosed 消费侧关闭流的哨兵错误：Close 后生产者未再 End 时由
+// Result 返回，消费方据此区分正常终止与主动中止。
+var ErrStreamClosed = errors.New("stream closed by consumer")
+
 // EventStream is a single-consumer stream of assistant message events with a
 // terminal result.
 //
@@ -73,14 +77,16 @@ func ErrorEvent(msg *Message) AssistantMessageEvent {
 // Concurrency: the event channel is never closed; consumers terminate when
 // they observe the terminal event (via Range, which also unblocks when the
 // stream ends), so a send can never race with a close. Push applies
-// backpressure when the consumer is behind; events pushed after End are
-// dropped.
+// backpressure when the consumer is behind; events pushed after End or Close
+// are dropped. Close lets a consumer abort early: it unblocks a producer
+// parked in Push and makes Result return ErrStreamClosed.
 type EventStream struct {
 	ch       chan AssistantMessageEvent
 	terminal chan *Message
 	done     chan struct{}
 
-	termOnce sync.Once
+	termOnce  sync.Once
+	closeOnce sync.Once
 }
 
 // NewEventStream creates a stream with the given event buffer size.
@@ -109,9 +115,22 @@ func (s *EventStream) Push(ev AssistantMessageEvent) {
 func (s *EventStream) End(msg *Message) {
 	s.termOnce.Do(func() {
 		s.terminal <- msg
-		close(s.done)
+		s.closeDone()
 		close(s.terminal)
 	})
+}
+
+// closeDone closes done exactly once, shared by End and Close so either call
+// order is safe.
+func (s *EventStream) closeDone() {
+	s.closeOnce.Do(func() { close(s.done) })
+}
+
+// Close aborts the stream from the consumer side. It is idempotent, unblocks
+// a producer parked in Push, and makes Result return ErrStreamClosed when no
+// terminal message was delivered. A later End still records its message.
+func (s *EventStream) Close() {
+	s.closeDone()
 }
 
 // Events returns the channel of streamed events. The channel is never
@@ -180,14 +199,37 @@ var errStopRange = errors.New("stop range iteration")
 
 // Result blocks until the stream terminates and returns the final message.
 // Failures are encoded in the message's StopReason ("error" or "aborted");
-// a Go error is only returned when the stream terminated without a terminal
-// message, which indicates misuse of the stream API.
+// ErrStreamClosed is returned when the consumer closed the stream without a
+// terminal message, and a Go error otherwise only when the stream terminated
+// without a terminal message, which indicates misuse of the stream API.
 func (s *EventStream) Result() (*Message, error) {
-	msg, ok := <-s.terminal
-	if !ok {
-		return nil, errors.New("stream ended without a terminal message")
+	// End 先投递 terminal 再关 done，这里先试 terminal 保证双就绪时优先取消息。
+	select {
+	case msg, ok := <-s.terminal:
+		if !ok {
+			return nil, errors.New("stream ended without a terminal message")
+		}
+		return msg, nil
+	default:
 	}
-	return msg, nil
+	select {
+	case msg, ok := <-s.terminal:
+		if !ok {
+			return nil, errors.New("stream ended without a terminal message")
+		}
+		return msg, nil
+	case <-s.done:
+		// done 已关：End 场景 terminal 必已投递，取不到即 Close 且无 End。
+		select {
+		case msg, ok := <-s.terminal:
+			if !ok {
+				return nil, errors.New("stream ended without a terminal message")
+			}
+			return msg, nil
+		default:
+			return nil, ErrStreamClosed
+		}
+	}
 }
 
 // LazyStream returns a stream that runs setup asynchronously and forwards
@@ -231,20 +273,17 @@ func endStream(s *EventStream, msg *Message) {
 }
 
 // textAccum accumulates streamed text deltas into a string. Each Append is
-// O(1) amortized (strings.Builder), and Current returns the accumulated text
-// without copying, so per-delta snapshots never re-copy the whole block (the
-// naive "s += d" pattern is O(n²) in the total length and dominates long
-// streaming replies and reasoning output).
+// O(1) amortized (strings.Builder) and returns the accumulated text without
+// copying, so per-delta snapshots never re-copy the whole block (the naive
+// "s += d" pattern is O(n²) in the total length and dominates long streaming
+// replies and reasoning output).
 //
-// A string returned by Current aliases the builder's buffer and stays valid
+// A string returned by Append aliases the builder's buffer and stays valid
 // as long as the builder is only appended to; Replace discards it. This is
 // the documented safe pattern for strings.Builder.
 type textAccum struct {
 	b strings.Builder
 }
-
-// Current returns the accumulated text without copying.
-func (a *textAccum) Current() string { return a.b.String() }
 
 // Append writes s and returns the accumulated text.
 func (a *textAccum) Append(s string) string {
