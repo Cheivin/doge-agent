@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -175,6 +176,13 @@ func TestOutputProtection(t *testing.T) {
 func TestHelperMCPServer(t *testing.T) {
 	if os.Getenv("DOGE_MCP_HELPER") != "1" {
 		return
+	}
+	// 并发建连测试用：把本进程 pid 追加进指定文件，测试据此统计被拉起的子进程数
+	if logPath := os.Getenv("DOGE_MCP_HELPER_PIDLOG"); logPath != "" {
+		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			_ = f.Close()
+		}
 	}
 	tools := []map[string]any{
 		{
@@ -374,6 +382,74 @@ func TestProxyNoServer(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "mcp-cache")); err == nil {
 		t.Fatal("cache dir created without config (lazy violated)")
 	}
+}
+
+// TestConnectSingleFlight 并发冷启动只允许拉起一个子进程：修复前两个
+// ensureConn 同时穿过检查会各建一条连接，后到者覆盖 s.sess 泄漏第一个 stdio child
+func TestConnectSingleFlight(t *testing.T) {
+	dir := t.TempDir()
+	pidLog := filepath.Join(dir, "helper.pids")
+	cfgPath := filepath.Join(dir, "mcp.json")
+	cfg := map[string]any{
+		"mcpServers": map[string]any{
+			"fake": map[string]any{
+				"command": os.Args[0],
+				"args":    []string{"-test.run=TestHelperMCPServer"},
+				"env":     map[string]string{"DOGE_MCP_HELPER": "1", "DOGE_MCP_HELPER_PIDLOG": pidLog},
+			},
+		},
+	}
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := New(Options{AgentDir: dir, Cwd: dir, ConfigPath: cfgPath, Version: "test"})
+	if err := m.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	s := m.servers["fake"]
+	m.mu.Unlock()
+	if s == nil {
+		t.Fatal("fake server missing")
+	}
+
+	const n = 8
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			errs <- s.connect(ctx)
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+	}
+	if !s.connected() {
+		t.Fatal("not connected after concurrent connect")
+	}
+	// pid 日志恰好一条：只有一个 helper 子进程被拉起
+	raw, err := os.ReadFile(pidLog)
+	if err != nil {
+		t.Fatalf("helper pid log missing: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line != "" {
+			seen[line] = true
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("spawned %d helper processes, want 1: %v", len(seen), seen)
+	}
+	m.Close()
 }
 
 // TestReconnect 重连：断开后再次连接仍可用

@@ -5,6 +5,7 @@ package tools
 
 import (
 	"context"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -174,16 +175,18 @@ func localExec(ctx context.Context, command string, opts ExecOptions) (*ExecResu
 
 	var stdout strings.Builder
 	var mu sync.Mutex
+	// 合并写与增量回调同锁串行：两条排空 goroutine 并发到达，而下游
+	// bash 工具的输出累积器（strings.Builder）并非并发安全
 	onOutput := func(data []byte) {
 		if len(data) == 0 {
 			return
 		}
 		mu.Lock()
 		stdout.Write(data)
-		mu.Unlock()
 		if opts.OnOutput != nil {
 			opts.OnOutput(data)
 		}
+		mu.Unlock()
 	}
 
 	killTree := func() {
@@ -204,30 +207,25 @@ func localExec(ctx context.Context, command string, opts ExecOptions) (*ExecResu
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
+	// stdout/stderr 各自并发排空：先读完 stdout 再读 stderr 时，子进程向
+	// stderr 写超 64KiB 会写满管道阻塞，stdout 又迟迟不关 → 互等死锁
+	var wg sync.WaitGroup
+	drain := func(r io.Reader) {
+		defer wg.Done()
 		buf := make([]byte, 32<<10)
 		for {
-			n, err := stdoutPipe.Read(buf)
+			n, err := r.Read(buf)
 			if n > 0 {
 				onOutput(buf[:n])
 			}
 			if err != nil {
-				break
+				return
 			}
 		}
-		buf2 := make([]byte, 32<<10)
-		for {
-			n, err := stderrPipe.Read(buf2)
-			if n > 0 {
-				onOutput(buf2[:n])
-			}
-			if err != nil {
-				break
-			}
-		}
-	}()
+	}
+	wg.Add(2)
+	go drain(stdoutPipe)
+	go drain(stderrPipe)
 
 	timedOut := false
 	waitErr := make(chan error, 1)
@@ -243,7 +241,7 @@ func localExec(ctx context.Context, command string, opts ExecOptions) (*ExecResu
 	case err := <-waitErr:
 		_ = err
 	}
-	<-done
+	wg.Wait()
 
 	mu.Lock()
 	out := &ExecResult{Stdout: truncateOutput(stdout.String()), ExitCode: cmd.ProcessState.ExitCode(), TimedOut: timedOut}

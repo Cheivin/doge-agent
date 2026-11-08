@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"doge/pkg/logx"
 )
 
 // SessionSummary is the lightweight metadata used for session listing.
@@ -100,6 +102,19 @@ func (m *SessionManager) ActiveFor(filePath string) *AgentSession {
 	return m.active[filePath]
 }
 
+// ActiveSessions lists every live registered instance (当前窗口、调度器 fork、
+// 远端任务 fork)。配置写盘后的热重载扇出用：只重载请求窗口会让其余活跃
+// 会话继续持旧模型目录——「改了配置没生效」即来源于此
+func (m *SessionManager) ActiveSessions() []*AgentSession {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	out := make([]*AgentSession, 0, len(m.active))
+	for _, s := range m.active {
+		out = append(out, s)
+	}
+	return out
+}
+
 // Dir returns the session root directory.
 func (m *SessionManager) Dir() string {
 	return m.dir
@@ -141,9 +156,13 @@ func (m *SessionManager) LoadSession(path string) (*Session, error) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 16<<20)
 
+	// off 已扫描字节偏移：残缺尾行按它截断，追加才能落在合法末条之后
+	// （否则 O_APPEND 会拼在残行上，文件永远修不回合法 JSONL）
+	off := int64(0)
 	line := 0
 	for scanner.Scan() {
 		data := scanner.Bytes()
+		off += int64(len(data)) + 1
 		if len(strings.TrimSpace(string(data))) == 0 {
 			continue
 		}
@@ -159,7 +178,21 @@ func (m *SessionManager) LoadSession(path string) (*Session, error) {
 		}
 		var entry SessionEntry
 		if err := json.Unmarshal(data, &entry); err != nil {
-			return nil, fmt.Errorf("invalid session entry at line %d: %w", line+1, err)
+			// 后面还有行 → 中间行损坏，仍是致命错误
+			if scanner.Scan() {
+				return nil, fmt.Errorf("invalid session entry at line %d: %w", line+1, err)
+			}
+			if serr := scanner.Err(); serr != nil {
+				return nil, serr
+			}
+			// 末行残缺可容忍：崩溃打断 append 的典型痕迹，丢弃并截掉，
+			// 从上一合法条目续写
+			logx.Warnf("[session] %s 尾行残缺已丢弃 (line %d): %v", path, line+1, err)
+			off -= int64(len(data)) + 1
+			if terr := os.Truncate(path, off); terr != nil {
+				logx.Warnf("[session] %s 尾行截断失败: %v", path, terr)
+			}
+			break
 		}
 		s.Entries = append(s.Entries, &entry)
 		s.idIndex[entry.ID] = &entry

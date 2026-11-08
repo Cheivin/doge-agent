@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -169,7 +170,8 @@ func runCodeScript(ctx context.Context, caller CodeCaller, language, script stri
 	// fd 3 in the child is the RPC channel.
 	cmd.ExtraFiles = []*os.File{childEnd}
 
-	var output strings.Builder
+	// os/exec 用两个 goroutine 分别拷贝 stdout/stderr，共享 writer 必须加锁
+	var output syncWriter
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 
@@ -241,6 +243,25 @@ func killProcessGroup(cmd *exec.Cmd) {
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+}
+
+// syncWriter 互斥保护的字节累积器：cmd.Stdout/cmd.Stderr 指向同一 writer 时，
+// os/exec 的两条拷贝 goroutine 会并发 Write
+type syncWriter struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 // jsToolsModule is injected into the script's directory; the model's script

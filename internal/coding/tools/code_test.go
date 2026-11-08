@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -127,5 +128,28 @@ func TestCodeToolMissingRuntime(t *testing.T) {
 	}
 	if !strings.Contains(result.Content[0].Text, "DOGE_CODE_RUNTIME") {
 		t.Errorf("missing runtime message = %q", result.Content[0].Text)
+	}
+}
+
+// TestSyncWriterConcurrent os/exec 用两条 goroutine 分别拷贝 stdout/stderr，
+// cmd.Stdout/cmd.Stderr 指向同一 writer 时必须自行加锁（-race 下验证）
+func TestSyncWriterConcurrent(t *testing.T) {
+	var w syncWriter
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				if _, err := w.Write([]byte("x")); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := w.String(); len(got) != 400 {
+		t.Fatalf("len = %d, want 400", len(got))
 	}
 }

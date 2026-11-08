@@ -87,26 +87,27 @@ func EditTool(ops *Operations) *agent.AgentTool {
 				return ToolError("edit: no edits provided"), nil
 			}
 
-			data, err := ops.ReadFile(path)
-			if err != nil {
-				return ToolError(fmt.Sprintf("edit: %v", err)), nil
-			}
-			content := stripBOM(string(data))
-			hadBOM := content != string(data)
-
 			var newContent string
 			var diff string
-			_ = WithPathLock(path, func() error {
+			// 读→改→写全程持锁：读放锁外时两个并发 edit 都基于原始内容
+			// 计算，后写者会覆盖先写者丢更新
+			err := WithPathLock(path, func() error {
+				data, err := ops.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				content := stripBOM(string(data))
+				hadBOM := content != string(data)
 				newContent, diff, err = applyEdits(content, edits, ops)
-				return nil
+				if err != nil {
+					return err
+				}
+				if hadBOM {
+					newContent = "\ufeff" + newContent
+				}
+				return ops.WriteFile(path, []byte(newContent), 0)
 			})
 			if err != nil {
-				return ToolError(fmt.Sprintf("edit: %v", err)), nil
-			}
-			if hadBOM {
-				newContent = "\ufeff" + newContent
-			}
-			if err := ops.WriteFile(path, []byte(newContent), 0); err != nil {
 				return ToolError(fmt.Sprintf("edit: %v", err)), nil
 			}
 			return &agent.AgentToolResult{

@@ -113,6 +113,13 @@ func GrepTool(ops *Operations) *agent.AgentTool {
 			}
 
 			if !info.IsDir() {
+				// 相对路径按会话 cwd 解析后再打开：web/remote 窗口的进程
+				// cwd ≠ 会话 cwd 时直接 open 原路径会静默落空，误报 No matches
+				if ops.Abs != nil {
+					if resolved, err := ops.Abs(path); err == nil {
+						path = resolved
+					}
+				}
 				searchFile(path)
 			} else {
 				_ = ops.WalkDir(path, func(file string, d fs.DirEntry, err error) error {

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -212,5 +213,99 @@ func TestSaveQuotaPrecheck(t *testing.T) {
 	}
 	if _, err := store.Save("c.txt", "web", "", strings.NewReader("x")); err != nil {
 		t.Fatalf("save after eviction: %v", err)
+	}
+}
+
+// TestSaveMetaJSONName 用户上传恰好名为 meta.json 的文件：内容不得被元数据
+// 覆盖（修复前内容与元数据同名落盘，写元数据时自覆盖，mesh pull 哈希校验失败）
+func TestSaveMetaJSONName(t *testing.T) {
+	s := NewStore(t.TempDir(), Config{})
+	data := []byte(`{"not":"metadata"}`)
+	meta, err := s.Save("meta.json", "web", "", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if meta.Name != "meta.json" {
+		t.Fatalf("name = %q, want meta.json", meta.Name)
+	}
+	got, f, err := s.Get(meta.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer f.Close()
+	body, _ := io.ReadAll(f)
+	if !bytes.Equal(body, data) {
+		t.Fatalf("content clobbered by metadata: %q", body)
+	}
+	sum := sha256.Sum256(data)
+	if got.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatal("sha256 mismatch")
+	}
+	// 内容不得落在保留的 meta.json 路径上
+	if got.Path == filepath.Join(s.Dir(), meta.ID, "meta.json") {
+		t.Fatalf("content must not live at reserved path: %q", got.Path)
+	}
+	// 保留路径上放的必须是元数据
+	var m Meta
+	raw, err := os.ReadFile(filepath.Join(s.Dir(), meta.ID, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.File == "" || m.File == "meta.json" {
+		t.Fatalf("meta.file = %q, want the .content redirect", m.File)
+	}
+}
+
+// TestSaveMetaJSONCaseInsensitive 大小写变体名（Meta.json）在大小写不敏感
+// 文件系统上同样与 meta.json 冲突，一并改存 .content
+func TestSaveMetaJSONCaseInsensitive(t *testing.T) {
+	s := NewStore(t.TempDir(), Config{})
+	meta, err := s.Save("META.JSON", "web", "", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if meta.File != "meta.json.content" {
+		t.Fatalf("file = %q, want meta.json.content", meta.File)
+	}
+	_, f, err := s.Get(meta.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	f.Close()
+}
+
+// TestOldLayoutReadable 旧布局条目（元数据无 file 字段、内容按 name 存放）
+// 仍可读：file 为空时按 name 解析内容路径，不做磁盘迁移
+func TestOldLayoutReadable(t *testing.T) {
+	dir := t.TempDir()
+	id := "ab12cd34ef56ab12cd34ef56ab12cd34"
+	entry := filepath.Join(dir, id)
+	if err := os.MkdirAll(entry, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("legacy content")
+	if err := os.WriteFile(filepath.Join(entry, "report.txt"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacy := fmt.Sprintf(`{"id":%q,"name":"report.txt","size":%d,"mimeType":"text/plain; charset=utf-8","sha256":"x","source":"web","createdAt":1}`, id, len(content))
+	if err := os.WriteFile(filepath.Join(entry, "meta.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewStore(dir, Config{})
+	meta, f, err := s.Get(id)
+	if err != nil {
+		t.Fatalf("get legacy: %v", err)
+	}
+	defer f.Close()
+	body, _ := io.ReadAll(f)
+	if !bytes.Equal(body, content) {
+		t.Fatalf("legacy content = %q", body)
+	}
+	if meta.Path != filepath.Join(entry, "report.txt") {
+		t.Fatalf("legacy path = %q, want %q", meta.Path, filepath.Join(entry, "report.txt"))
 	}
 }

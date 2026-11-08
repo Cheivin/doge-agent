@@ -30,10 +30,17 @@ type server struct {
 	lastUse time.Time
 	tools   []*mcp.Tool // 元数据（连接成功时刷新；无连接时来自磁盘缓存）
 	lastErr string
+
+	// connectMu 串行化建连全程：冷启动时只靠 mu 内检查就放行，两个并发
+	// ensureConn 会各 spawn 一条传输，后到者覆盖 s.sess 泄漏第一个 stdio child
+	connectMu sync.Mutex
 }
 
 // connect 建立连接（幂等：已连接则直接返回）
 func (s *server) connect(ctx context.Context) error {
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
+
 	s.mu.Lock()
 	if s.sess != nil {
 		s.mu.Unlock()
@@ -110,8 +117,10 @@ func expandEnv(v string) string {
 	return os.Expand(v, func(key string) string { return os.Getenv(key) })
 }
 
-// disconnect 断开连接并释放子进程
+// disconnect 断开连接并释放子进程（与 connect 互斥，避免拆掉刚建好的会话）
 func (s *server) disconnect() {
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
 	s.mu.Lock()
 	if s.sess == nil {
 		s.mu.Unlock()

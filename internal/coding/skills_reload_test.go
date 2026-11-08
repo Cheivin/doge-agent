@@ -73,6 +73,7 @@ func TestReloadSkillsConcurrentAccess(t *testing.T) {
 	}()
 	for i := 0; i < 200; i++ {
 		_ = sess.loadedSkills()
+		_ = sess.SkillsInfo()
 		_ = sess.expandCommands("/skill:demo")
 	}
 	<-done

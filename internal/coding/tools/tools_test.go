@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,6 +166,52 @@ func TestEditTool(t *testing.T) {
 	}
 }
 
+// TestEditToolConcurrent 并发 edit 同一文件不得丢更新：读→改→写全程持
+// 路径锁，每个 goroutine 插入一行，结束后三行都必须在（-race 下运行）
+func TestEditToolConcurrent(t *testing.T) {
+	dir := tmpDir(t)
+	path := filepath.Join(dir, "c.txt")
+	writeFile(t, path, "start\n")
+
+	ops := LocalOperations()
+	tool := EditTool(ops)
+
+	lines := []string{"line-a", "line-b", "line-c"}
+	var wg sync.WaitGroup
+	for _, line := range lines {
+		wg.Add(1)
+		go func(line string) {
+			defer wg.Done()
+			r, err := tool.Execute("call", map[string]any{
+				"path":  path,
+				"edits": []any{map[string]any{"oldText": "start", "newText": "start\n" + line}},
+			}, context.Background(), nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if !strings.Contains(resultText(r), "Edited") {
+				t.Errorf("edit result = %q", resultText(r))
+			}
+		}(line)
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range lines {
+		if !strings.Contains(string(data), line) {
+			t.Errorf("lost update: %q missing from %q", line, data)
+		}
+	}
+	// 锚点只插入一次：锁串行化后每个 goroutine 都基于最新内容重读重算
+	if got := strings.Count(string(data), "start"); got != 1 {
+		t.Errorf("anchor count = %d, want 1: %q", got, data)
+	}
+}
+
 func TestEditToolFuzzyMatch(t *testing.T) {
 	dir := tmpDir(t)
 	path := filepath.Join(dir, "f.txt")
@@ -233,6 +280,35 @@ func TestBashTool(t *testing.T) {
 	}
 }
 
+// TestLocalExecStderrFlood 子进程向 stderr 写 200KiB 而 stdout 迟迟不关时
+// 必须立即返回：修复前先排空 stdout 再读 stderr，stderr 管道 64KiB 写满后
+// 子进程阻塞 → 互等直到超时被杀
+func TestLocalExecStderrFlood(t *testing.T) {
+	t.Setenv("SHELL", "/bin/sh")
+	ops := LocalOperations()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	res, err := ops.Exec(ctx, "head -c 204800 /dev/zero >&2; echo STDERR_MARK_OK >&2; echo stdout_done", ExecOptions{})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("exec blocked for %v (drain deadlock)", elapsed)
+	}
+	if res.TimedOut {
+		t.Fatal("command unexpectedly timed out")
+	}
+	// stdout 与 stderr 合并捕获，两端都要拿到
+	if !strings.Contains(res.Stdout, "STDERR_MARK_OK") {
+		t.Errorf("stderr tail not captured: %q", res.Stdout[len(res.Stdout)-200:])
+	}
+	if !strings.Contains(res.Stdout, "stdout_done") {
+		t.Errorf("stdout not captured: %q", res.Stdout[len(res.Stdout)-200:])
+	}
+}
+
 func TestGrepTool(t *testing.T) {
 	dir := tmpDir(t)
 	writeFile(t, filepath.Join(dir, "main.go"), "package main\nfunc main() {}\n")
@@ -262,6 +338,27 @@ func TestGrepTool(t *testing.T) {
 	r = runTool(t, tool, map[string]any{"pattern": "FUNC", "path": dir, "ignoreCase": true, "literal": true})
 	if !strings.Contains(resultText(r), "main.go:2") {
 		t.Errorf("ignoreCase result = %q", resultText(r))
+	}
+}
+
+// TestGrepRelativeFileWithSessionCwd 会话 cwd 与进程 cwd 不同时，单文件
+// 相对路径也必须按会话 cwd 解析（web/remote 窗口场景），不得误报 No matches
+func TestGrepRelativeFileWithSessionCwd(t *testing.T) {
+	sessionDir := tmpDir(t)
+	writeFile(t, filepath.Join(sessionDir, "note.txt"), "needle here\n")
+
+	// 进程 cwd（go test 的包目录）在别处，相对路径只随会话 cwd 解析
+	ops := WithCwd(LocalOperations(), NewCwdCell(sessionDir))
+	r := runTool(t, GrepTool(ops), map[string]any{"pattern": "needle", "path": "note.txt"})
+	text := resultText(r)
+	if !strings.Contains(text, "note.txt:1") || !strings.Contains(text, "needle here") {
+		t.Errorf("grep relative file with session cwd = %q", text)
+	}
+
+	// 目录模式回归：同样场景下走 WalkDir 的路径保持可用
+	r = runTool(t, GrepTool(ops), map[string]any{"pattern": "needle", "path": "."})
+	if !strings.Contains(resultText(r), "needle here") {
+		t.Errorf("grep relative dir with session cwd = %q", resultText(r))
 	}
 }
 

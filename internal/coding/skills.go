@@ -239,8 +239,10 @@ type SkillInfo struct {
 // tool and <available_skills> block (mirrors the session-level MCP view).
 func (s *AgentSession) SkillsInfo() []SkillInfo {
 	disabled := DisabledSkillSet(s.Cwd)
-	out := make([]SkillInfo, 0, len(s.skills))
-	for _, sk := range s.skills {
+	// reloadSkills 从 HTTP goroutine 持锁写 s.skills，读取必须走快照
+	skills := s.loadedSkills()
+	out := make([]SkillInfo, 0, len(skills))
+	for _, sk := range skills {
 		out = append(out, SkillInfo{
 			Name:                   sk.Name,
 			Description:            sk.Description,

@@ -2,6 +2,9 @@
 // 拿到 uploadID 后再按用途（进对话/放置/应用配置）取用，与来源解耦。
 //
 // 存储布局：<dir>/<id>/<name> 为内容，<dir>/<id>/meta.json 为元数据。
+// 保留名：用户文件恰好名为 meta.json（或不区分大小写的等价名）时内容改存
+// meta.json.content，防止元数据落盘时自覆盖；元数据 file 字段记录实际内容
+// 名，旧库条目无该字段按 name 取（兼容已存在的旧布局，不变更磁盘格式）。
 // 会话 JSONL 只存引用，不内嵌文件内容（多模态图片除外）。
 package uploads
 
@@ -104,6 +107,9 @@ type Meta struct {
 	Source    string `json:"source"` // "web" | "mesh:<peerID>"
 	Window    string `json:"window,omitempty"`
 	CreatedAt int64  `json:"createdAt"` // Unix 毫秒
+	// File 内容在条目目录内的实际文件名；旧库元数据无该字段（空值）按
+	// Name 取——兼容已存在的旧布局条目
+	File string `json:"file,omitempty"`
 
 	// Path 内容绝对路径，读取时由 Store 补上（不落盘）
 	Path string `json:"-"`
@@ -174,6 +180,12 @@ func (s *Store) Save(name, source, window string, src io.Reader) (*Meta, error) 
 	if name == "" {
 		name = "upload"
 	}
+	// meta.json 保留给元数据：同名内容（不区分大小写，兼容大小写不敏感
+	// 文件系统）改存 .content 后缀，防止元数据落盘时覆盖掉用户内容
+	contentName := name
+	if strings.EqualFold(contentName, metaFile) {
+		contentName = metaFile + ".content"
+	}
 	id := newID()
 	entry := filepath.Join(s.dir, id)
 	if err := os.Mkdir(entry, 0o755); err != nil {
@@ -192,7 +204,7 @@ func (s *Store) Save(name, source, window string, src io.Reader) (*Meta, error) 
 	}
 	head = head[:n]
 
-	f, err := os.OpenFile(filepath.Join(entry, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(filepath.Join(entry, contentName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fail(err)
 	}
@@ -219,7 +231,8 @@ func (s *Store) Save(name, source, window string, src io.Reader) (*Meta, error) 
 		Source:    source,
 		Window:    window,
 		CreatedAt: time.Now().UnixMilli(),
-		Path:      filepath.Join(entry, name),
+		File:      contentName,
+		Path:      filepath.Join(entry, contentName),
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -365,8 +378,17 @@ func (s *Store) meta(id string) (*Meta, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
-	m.Path = filepath.Join(s.dir, m.ID, m.Name)
+	m.Path = filepath.Join(s.dir, m.ID, m.contentName())
 	return &m, nil
+}
+
+// contentName 条目目录内的内容文件名：新元数据带 file 字段；旧库无该字段
+// 按 name 取（兼容已存在的旧布局条目，不做磁盘迁移）
+func (m *Meta) contentName() string {
+	if m.File != "" {
+		return m.File
+	}
+	return m.Name
 }
 
 // checkDisk uploads 卷剩余空间不足时拒绝写入
