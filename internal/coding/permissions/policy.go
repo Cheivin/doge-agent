@@ -69,6 +69,11 @@ type Policy struct {
 		// empty uses the session model.
 		Model string `json:"model,omitempty"`
 	} `json:"llmApproval,omitempty"`
+
+	// UnattendedAllowDirs 运行时字段：无人值守会话（remote/automation fork）
+	// 在 externalDirectory=deny 下仍允许访问的绝对目录前缀（如上传暂存区，
+	// 远端任务下发的文件落在这里）。不落盘，仅由 UnattendedPolicy 构造
+	UnattendedAllowDirs []string `json:"-"`
 }
 
 // BashRule is one command pattern rule. Pattern supports * and ? globs
@@ -76,7 +81,15 @@ type Policy struct {
 type BashRule struct {
 	Pattern  string `json:"pattern"`
 	Decision string `json:"decision"`
+	// Tier 规则来源层级：0 全局文件，1 项目文件；项目层不得放宽全局层
+	Tier int `json:"-"`
 }
+
+// bash 规则来源层级：LoadPolicy 首个文件记为全局，其余记为项目
+const (
+	tierGlobal  = 0
+	tierProject = 1
+)
 
 // UnmarshalJSON accepts bash rules as either an array of {pattern,
 // decision} objects or a plain object map (object key order is preserved
@@ -157,15 +170,24 @@ func (p *Policy) UnmarshalJSON(data []byte) error {
 }
 
 // LoadPolicy loads the permission policy from the given files, in order.
-// Later files may only tighten (deny/ask) decisions relative to earlier
-// ones: a project file can never widen a global deny to allow.
+// The first file is the global tier, every later file a project tier.
+// Bash matching picks the longest pattern within each tier and the
+// strictest decision across tiers, so a project file can never widen a
+// global deny/ask into allow, and only global-tier rules may override the
+// built-in soft denies (see applySoftBuiltin).
 func LoadPolicy(files ...string) (*Policy, error) {
 	p := &Policy{}
 	// Built-in hard-deny baseline is enforced by the decider regardless of
 	// the loaded policy; nothing to seed here.
+	global := true // 首个非空路径占全局层位置，文件缺失也不让位
 	for _, f := range files {
 		if f == "" {
 			continue
+		}
+		tier := tierProject
+		if global {
+			tier = tierGlobal
+			global = false
 		}
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -177,6 +199,10 @@ func LoadPolicy(files ...string) (*Policy, error) {
 		next := &Policy{}
 		if err := json.Unmarshal(data, next); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", f, err)
+		}
+		// 按文件位置标注 bash 规则来源层级
+		for j := range next.Bash {
+			next.Bash[j].Tier = tier
 		}
 		mergePolicy(p, next)
 	}
@@ -207,9 +233,10 @@ func mergePolicy(base, next *Policy) {
 		}
 		base.Tools[k] = v
 	}
-	// Bash rules: later rules append; the decider's specificity sort keeps
-	// behavior deterministic, and hard-deny in earlier files is preserved
-	// by the decider's builtin layer (rules cannot loosen builtin denies).
+	// Bash rules: later rules append, keeping their source tier; matching
+	// picks the longest pattern within each tier and the strictest decision
+	// across tiers (see matchBashRules), so project rules cannot loosen
+	// global ones and the hard-deny builtin layer stays unloosenable.
 	base.Bash = append(base.Bash, next.Bash...)
 	if next.Special.ExternalDirectory != "" {
 		if base.Special.ExternalDirectory != string(Deny) {
@@ -262,4 +289,32 @@ func DefaultPaths(agentDir, cwd string) []string {
 		filepath.Join(agentDir, "permissions.json"),
 		filepath.Join(cwd, ".doge", "permissions.json"),
 	}
+}
+
+// UnattendedPolicy derives the policy for unattended sessions (remote mesh
+// task forks, automation runs): the external-directory guard is forced to
+// deny so a task cannot read ~/.doge/agent (auth.json, mesh-key) or rewrite
+// permissions.json/automations.json to escalate, with explicit exceptions for
+// the given absolute directory prefixes (the uploads staging dir — remote
+// tasks receive files there). The base policy is deep-copied; the caller's
+// policy is never mutated.
+func UnattendedPolicy(base *Policy, allowExternalDirs ...string) *Policy {
+	if base == nil {
+		base = &Policy{}
+	}
+	cp := *base
+	cp.Special.ExternalDirectory = string(Deny)
+	dirs := make([]string, 0, len(allowExternalDirs))
+	for _, d := range allowExternalDirs {
+		if d == "" {
+			continue
+		}
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			continue
+		}
+		dirs = append(dirs, abs)
+	}
+	cp.UnattendedAllowDirs = dirs
+	return &cp
 }

@@ -156,9 +156,11 @@ func (d *Decider) decideBash(cmd string) (Decision, string) {
 	}
 
 	// Whole-command builtins first: `curl * | sh` is dangerous as a unit
-	// even though its two sides are individually safe.
+	// even though its two sides are individually safe. 前缀执行器剥离后的
+	// 等效命令一并参与匹配，env/nohup 包装不能绕过硬拒与软内建。
+	stripped := stripPrefixRunners(cmd)
 	for _, r := range builtinRules {
-		if MatchPattern(r.pattern, cmd) {
+		if MatchPattern(r.pattern, cmd) || (stripped != cmd && MatchPattern(r.pattern, stripped)) {
 			if r.hard {
 				return Deny, "high-risk command: " + r.pattern
 			}
@@ -169,8 +171,8 @@ func (d *Decider) decideBash(cmd string) (Decision, string) {
 	}
 
 	// Semantic rm detection on the whole command: a hard deny that no
-	// user rule can override.
-	if destructiveRm(cmd) {
+	// user rule can override. 剥离后的命令同样过语义检测。
+	if destructiveRm(cmd) || (stripped != cmd && destructiveRm(stripped)) {
 		return Deny, "high-risk command: destructive recursive delete"
 	}
 
@@ -201,13 +203,34 @@ func (d *Decider) decideBash(cmd string) (Decision, string) {
 	return d.evaluateSegment(cmd, 0)
 }
 
-// applySoftBuiltin denies a whole-command soft builtin match unless an
-// explicit user rule allows the command.
+// applySoftBuiltin denies a whole-command soft builtin match unless a
+// global-tier user rule allows the command; project-tier rules may only
+// tighten a global rule, never the built-in deny baseline itself.
 func (d *Decider) applySoftBuiltin(cmd, pattern string) (Decision, string) {
-	if dd, rule := matchBashRules(d.policy().Bash, cmd); dd != "" {
-		return dd, "bash rule: " + rule
+	gDec, gPat := matchBashRules(bashRulesOfTier(d.policy().Bash, tierGlobal), cmd)
+	if gDec == "" {
+		// 项目层规则不得放宽软内建基线
+		return Deny, "high-risk command: " + pattern
 	}
-	return Deny, "high-risk command: " + pattern
+	if pDec, pPat := matchBashRules(bashRulesOfTier(d.policy().Bash, tierProject), cmd); pDec != "" && moreRestrictive(pDec, gDec) {
+		return pDec, "bash rule: " + pPat
+	}
+	return gDec, "bash rule: " + gPat
+}
+
+// bashRulesOfTier 过滤出指定来源层级的 bash 规则；非全局层级一律按项目层归组
+func bashRulesOfTier(rules []BashRule, tier int) []BashRule {
+	out := make([]BashRule, 0, len(rules))
+	for _, r := range rules {
+		rt := r.Tier
+		if rt != tierGlobal {
+			rt = tierProject
+		}
+		if rt == tier {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // evaluateSegment applies the rule chain to one command segment, unwrapping
@@ -223,6 +246,11 @@ func (d *Decider) evaluateSegment(cmd string, depth int) (Decision, string) {
 	}
 	// Unwrap shell wrappers so sh -c "rm -rf /" is checked as rm -rf /.
 	if inner, ok := unwrapShell(cmd); ok {
+		return d.evaluateSegment(normalizeCommand(inner), depth+1)
+	}
+
+	// 剥离前缀执行器：env/nohup/timeout 等包装下的命令继续走完整判定链
+	if inner, ok := unwrapPrefixRunner(cmd); ok {
 		return d.evaluateSegment(normalizeCommand(inner), depth+1)
 	}
 
@@ -272,21 +300,37 @@ func moreRestrictive(a, b Decision) bool {
 	return rank(a) > rank(b)
 }
 
-// matchBashRules finds the most specific matching rule. Rules are sorted
-// by pattern length (longer = more specific); ties keep configuration
-// order (stable sort).
+// matchBashRules finds the strictest matching rule: the longest pattern
+// wins within each source tier (ties keep configuration order), then the
+// strictest decision wins across tiers (deny > ask > allow), so project
+// rules can tighten but never loosen global ones. An empty decision is
+// treated as no match.
 func matchBashRules(rules []BashRule, cmd string) (Decision, string) {
-	ordered := make([]BashRule, len(rules))
-	copy(ordered, rules)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return len(ordered[i].Pattern) > len(ordered[j].Pattern)
-	})
-	for _, r := range ordered {
-		if MatchPattern(r.Pattern, cmd) {
-			return Decision(r.Decision), r.Pattern
+	bestPat := [2]string{}
+	bestDec := [2]Decision{}
+	for _, r := range rules {
+		if r.Decision == "" || !MatchPattern(r.Pattern, cmd) {
+			continue
+		}
+		tier := r.Tier
+		if tier != tierGlobal {
+			tier = tierProject // 非法层级一律按项目层归组
+		}
+		if bestPat[tier] == "" || len(r.Pattern) > len(bestPat[tier]) {
+			bestPat[tier] = r.Pattern
+			bestDec[tier] = Decision(r.Decision)
 		}
 	}
-	return "", ""
+	dec, pat := Decision(""), ""
+	for i, d := range bestDec {
+		if d == "" {
+			continue
+		}
+		if dec == "" || moreRestrictive(d, dec) {
+			dec, pat = d, bestPat[i]
+		}
+	}
+	return dec, pat
 }
 
 // decideTool checks tool-name rules. Path-scoped tool rules
@@ -318,6 +362,8 @@ func (d *Decider) decideTool(toolName string, targetPath string) (Decision, stri
 }
 
 // decidePathGuard applies the external-directory guard for path tools.
+// 无人值守策略（UnattendedPolicy）可带 allowlist： uploads 暂存区这类
+// 指定目录在 deny 之下仍可访问（远端任务下发的文件落在这里）。
 func (d *Decider) decidePathGuard(ctx CheckContext) Decision {
 	if d.policy().Special.ExternalDirectory == "" {
 		return Allow
@@ -336,7 +382,16 @@ func (d *Decider) decidePathGuard(ctx CheckContext) Decision {
 	if withinDir(d.cwd, abs) {
 		return Allow
 	}
-	return Decision(d.policy().Special.ExternalDirectory)
+	decision := Decision(d.policy().Special.ExternalDirectory)
+	if decision != Deny {
+		return decision
+	}
+	for _, dir := range d.policy().UnattendedAllowDirs {
+		if withinDir(dir, abs) {
+			return Allow
+		}
+	}
+	return Deny
 }
 
 // pathTool reports whether the tool takes a file path argument.
@@ -505,11 +560,14 @@ func (d *Decider) autoDecide(req AskRequest) (bool, string) {
 		return false, "permission denied (unattended mode)"
 	}
 	cmd := req.Command
-	level := classifyRisk(cmd)
+	stripped := stripPrefixRunners(cmd)
+	// 风险分级看穿透前缀执行器后的真实命令，env curl 不再判为只读
+	level := classifyRisk(stripped)
 
 	// humanOnly patterns always require a human; denied unattended.
+	// 包装前后的命令形态都参与匹配，humanOnly 不能被 env/nohup 绕过。
 	for _, pattern := range d.policy().HumanOnly {
-		if MatchPattern(pattern, cmd) {
+		if MatchPattern(pattern, cmd) || (stripped != cmd && MatchPattern(pattern, stripped)) {
 			return false, "requires human approval: " + pattern
 		}
 	}
