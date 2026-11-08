@@ -64,6 +64,7 @@ func runWebMode(a *app.App, opts cliOptions, cfg *coding.WebSettings) {
 		Token:       token,
 		Address:     address,
 		Mesh:        a.MeshView,
+		MeshRuntime: &appMeshRuntime{a: a, version: version},
 		Mcp:         a.Mcp,
 		Automations: a.Automation,
 		CorsOrigins: corsOrigins,
@@ -120,6 +121,17 @@ func shutdownWeb(srv *web.Server) {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 }
+
+// appMeshRuntime 把 app.App 的 mesh 节点运行时暴露给 Web 控制台
+// （/api/mesh/running|start|stop 与桌面端 MeshService 同一入口）
+type appMeshRuntime struct {
+	a       *app.App
+	version string
+}
+
+func (m *appMeshRuntime) Running() bool { return m.a.MeshNode != nil }
+func (m *appMeshRuntime) Start() error  { return m.a.StartMesh(m.version, "") }
+func (m *appMeshRuntime) Stop()         { m.a.StopMesh() }
 
 // displayWebAccess 打印控制台 URL 和令牌，并打开浏览器
 func displayWebAccess(host string, port int, token string, tuiActive bool) {

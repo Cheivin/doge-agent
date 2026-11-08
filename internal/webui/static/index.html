@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>doge</title>
+<title>doge console</title>
 <link rel="stylesheet" href="/style.css">
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
 </head>
 <body>
 
@@ -91,7 +91,6 @@
       <button class="settings-tab" data-tab="mcp">Ⓜ MCP 服务器</button>
       <button class="settings-tab" data-tab="skills">✦ 技能</button>
       <button class="settings-tab" data-tab="mesh">◈ Mesh 网络</button>
-      <button class="settings-tab" data-tab="perm">⛨ 权限策略</button>
     </nav>
     <div class="settings-nav-foot">
       <button id="nav-reload">↻ 重载配置</button>
@@ -197,27 +196,7 @@
   </div>
 </div>
 
-<script>
-// 桌面端启动诊断：module 加载失败/运行时报错都上报到 Go 日志（js:err）
-window.__booted = false;
-function __diag(msg) {
-  try { import("/wails/runtime.js").then((r) => r.Events.Emit("js:err", msg)).catch(() => {}); } catch (_) {}
-  var d = document.createElement("div");
-  d.style.cssText = "position:fixed;inset:auto 0 0 0;z-index:99999;background:#7f1d1d;color:#fff;" +
-    "font:12px/1.5 ui-monospace,Menlo,monospace;padding:8px 12px;white-space:pre-wrap;";
-  d.textContent = msg;
-  (document.body || document.documentElement).appendChild(d);
-}
-window.addEventListener("error", function (e) {
-  __diag("JS ERROR: " + e.message + " @" + String(e.filename || "").split("/").pop() + ":" + (e.lineno || 0));
-});
-window.addEventListener("unhandledrejection", function (e) {
-  __diag("JS REJECTION: " + String((e.reason && e.reason.message) || e.reason));
-});
-setTimeout(function () {
-  if (!window.__booted) __diag("app.js module 未启动（import 失败或 MIME 被拒？）");
-}, 3000);
-</script>
+<script type="module" src="/platform.js"></script>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

@@ -35,6 +35,7 @@ type Options struct {
 	Token       string                   // 访问令牌，空则自动生成
 	Address     string                   // 监听地址，如 "127.0.0.1:8080"
 	Mesh        MeshView                 // mesh 网络视图，nil 则隐藏面板
+	MeshRuntime MeshRuntime              // mesh 节点运行时启停钩子，nil 则启停/运行态 503
 	Mcp         McpView                  // MCP 管理器视图
 	Automations console.AutomationSource // 定时任务管理面，nil 则 /api/automations 503
 	CorsOrigins []string                 // CORS 允许的源，"*" 允许所有
@@ -63,6 +64,14 @@ type MeshView interface {
 	ForwardAdd(rule mesh.ForwardRule) error
 	ForwardRemove(name string) error
 	ForwardSetEnabled(name string, enabled bool) error
+}
+
+// MeshRuntime mesh 节点运行时启停钩子（nil = /api/mesh/running|start|stop 503）。
+// web 宿主通常只持只读 MeshView；桌面壳等持有 App 的宿主注入节点运行时。
+type MeshRuntime interface {
+	Running() bool
+	Start() error
+	Stop()
 }
 
 // McpView 向 Web 控制台暴露 MCP 管理器
@@ -99,6 +108,9 @@ type Server struct {
 
 	// meshView backs the mesh panel (nil = mesh disabled/not compiled in).
 	meshView MeshView
+
+	// meshRuntime backs the mesh start/stop/running endpoints (nil = 503).
+	meshRuntime MeshRuntime
 
 	// mcpView backs the MCP endpoints (nil = MCP disabled/not initialized).
 	mcpView McpView
@@ -175,6 +187,7 @@ func NewServer(opts Options) (*Server, error) {
 		pendingQuestions: map[string]map[string]agent.Question{},
 		addr:             addr,
 		meshView:         opts.Mesh,
+		meshRuntime:      opts.MeshRuntime,
 		mcpView:          opts.Mcp,
 		automations:      opts.Automations,
 		shutdown:         opts.Shutdown,
@@ -472,6 +485,7 @@ func (s *Server) handler() http.Handler {
 	mux.Handle("POST /api/model", s.requireAuth(s.handleModel))
 	mux.Handle("POST /api/thinking", s.requireAuth(s.handleThinking))
 	mux.Handle("GET /api/session", s.requireAuth(s.handleSession))
+	mux.Handle("GET /api/session/messages", s.requireAuth(s.handleSessionMessages))
 	mux.Handle("GET /api/sessions", s.requireAuth(s.handleSessionList))
 	mux.Handle("POST /api/session/new", s.requireAuth(s.handleSessionNew))
 	mux.Handle("POST /api/session/switch", s.requireAuth(s.handleSessionSwitch))
@@ -482,6 +496,16 @@ func (s *Server) handler() http.Handler {
 	mux.Handle("POST /api/question/answer", s.requireAuth(s.watchQuestionAnswer(s.handleQuestionAnswer)))
 	mux.Handle("POST /api/permission/answer", s.requireAuth(s.handlePermissionAnswer))
 	mux.Handle("GET /api/mesh", s.requireAuth(s.handleMesh))
+	// mesh 运行开关与权限配置（桌面能力反向赋能；运行时钩子缺省 503）
+	mux.Handle("GET /api/mesh/running", s.requireAuth(s.handleMeshRunning))
+	mux.Handle("GET /api/mesh/config", s.requireAuth(s.handleMeshConfigGet))
+	mux.Handle("POST /api/mesh/config", s.requireAuth(s.handleMeshConfigPut))
+	mux.Handle("POST /api/mesh/start", s.requireAuth(s.handleMeshStart))
+	mux.Handle("POST /api/mesh/stop", s.requireAuth(s.handleMeshStop))
+
+	// 权限策略读写（桌面能力反向赋能：校验 + 备份 + 全局热重载）
+	mux.Handle("GET /api/permissions", s.requireAuth(s.handlePermissionsGet))
+	mux.Handle("PUT /api/permissions", s.requireAuth(s.handlePermissionsPut))
 	mux.Handle("GET /api/mesh/forwards", s.requireAuth(s.handleMeshForwardsList))
 	mux.Handle("POST /api/mesh/forwards", s.requireAuth(s.handleMeshForwardsAdd))
 	mux.Handle("POST /api/mesh/forwards/{name}/enable", s.requireAuth(s.handleMeshForwardsSetEnabled(true)))

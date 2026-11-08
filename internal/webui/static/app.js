@@ -1,7 +1,10 @@
-import { Call, Events } from "/wails/runtime.js";
-window.__booted = true;
-/* doge Web console — vanilla JS SPA, no build step. */
-"use strict";
+/* doge 控制台共享 UI 内核 — vanilla JS SPA，无构建步骤。web 与 desktop 复用
+   同一份 UI，传输差异（api / 事件流 / confirm / prompt / 能力开关）收敛在
+   /platform.js：web 服务 internal/webui/static/platform-web.js，desktop 服务
+   其 overlay 的 platform-desktop.js（同一 interface）。 */
+import { answerPermission, api, caps, confirmDialog, connect, promptDialog } from "/platform.js";
+
+window.__booted = true; // 桌面端启动诊断标记（platform-desktop.js 3s 兜底检查用）
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -19,182 +22,6 @@ const clientId = (() => {
   return id;
 })();
 
-// api 桌面端数据层：fetch 调用映射为 typed Service 绑定（响应形状与
-// Web API 契约一致），FormData 上传转 base64 服务调用，事件流走 wails Events。
-function api(path, opts) {
-  opts = opts || {};
-  return desktopApi(path, opts);
-}
-
-function resOK(data) {
-  return { ok: true, status: 200, json: async () => data };
-}
-function resErr(status, msg) {
-  return { ok: false, status, json: async () => ({ error: msg }) };
-}
-function kindStatus(kind) {
-  return { invalid: 400, notfound: 404, busy: 409, readonly: 403, unavailable: 404 }[kind] || 500;
-}
-function fileToB64(f) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve({
-      name: f.name,
-      mimeType: f.type || "application/octet-stream",
-      data: String(r.result).split(",", 2)[1] || "",
-    });
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(f);
-  });
-}
-
-async function desktopApi(path, opts) {
-  const method = (opts.method || "GET").toUpperCase();
-  const u = new URL(path, location.href);
-  const p = u.pathname;
-  if (opts.body instanceof FormData) {
-    if (p !== "/api/uploads") return resErr(400, "unsupported multipart target");
-    const files = [];
-    for (const [, v] of opts.body.entries()) {
-      if (typeof v !== "string") files.push(await fileToB64(v));
-    }
-    if (!files.length) return resErr(400, "no file field");
-    try {
-      return resOK(await Call.ByName("doge/desktop/services.UploadsService.Upload", files));
-    } catch (e) {
-      return resErr(kindStatus(e.kind), e.message || String(e));
-    }
-  }
-  let body = {};
-  if (opts.body != null) {
-    try { body = JSON.parse(opts.body); } catch (_) { return resErr(400, "invalid request body"); }
-  }
-  const S = (name, ...args) => Call.ByName("doge/desktop/services." + name, ...args);
-  try {
-    if (method === "GET") {
-      if (p === "/api/status") return resOK(await S("SessionService.Status"));
-      if (p === "/api/stats") return resOK(await S("SessionService.Stats"));
-      if (p === "/api/models") return resOK({ models: await S("SessionService.Models", u.searchParams.get("all") === "1") });
-      if (p === "/api/session") return resOK(await S("SessionService.Info"));
-      if (p === "/api/session/messages") return resOK(await S("SessionService.MessagesBefore", Number(u.searchParams.get("before")) || 0, Number(u.searchParams.get("limit")) || 0));
-      if (p === "/api/sessions") return resOK({ sessions: await S("SessionService.List") });
-      if (p === "/api/mesh") return resOK(await S("MeshService.Info"));
-      if (p === "/api/mesh/config") return resOK(await S("MeshService.ConfigGet"));
-      if (p === "/api/mesh/running") return resOK(await S("MeshService.Running"));
-      if (p === "/api/permissions") return resOK(await S("ConfigService.PermissionsGet"));
-      if (p === "/api/mesh/forwards") return resOK(await S("MeshService.Forwards"));
-      if (p === "/api/mcp") return resOK(await S("McpService.Info"));
-      if (p === "/api/session/mcp") return resOK(await S("McpService.SessionState"));
-      if (p === "/api/skills") return resOK(await S("SkillsService.List"));
-      if (p === "/api/session/skills") return resOK(await S("SkillsService.SessionSkills"));
-      if (p === "/api/config/models") return resOK(await S("ConfigService.ModelsGet"));
-      if (p === "/api/config") return resOK(await S("ConfigService.Overview"));
-      if (p === "/api/config/settings") return resOK(await S("ConfigService.SettingsGet"));
-      if (p === "/api/config/auth") return resOK(await S("ConfigService.AuthGet"));
-      if (p === "/api/config/providers") return resOK(await S("ConfigService.Providers"));
-      if (p === "/api/automations") return resOK(await S("AutomationsService.List"));
-      if (p.startsWith("/api/automations/")) {
-        const rest = p.slice("/api/automations/".length).split("/");
-        const id = decodeURIComponent(rest[0]);
-        if (rest.length === 1) return resOK(await S("AutomationsService.Get", id, 5));
-        if (rest[1] === "runs") return resOK(await S("AutomationsService.Runs", id, Number(u.searchParams.get("limit")) || 10));
-      }
-      if (p === "/api/fs/ls") return resOK(await S("ConfigService.FsList", u.searchParams.get("path") || ""));
-      if (p === "/api/auth/whoami") return resOK({ ok: true, method: "desktop" });
-    } else if (method === "DELETE") {
-      if (p.startsWith("/api/mcp/servers/")) { await S("McpService.ServerRemove", decodeURIComponent(p.slice("/api/mcp/servers/".length))); return resOK({ ok: true }); }
-      if (p.startsWith("/api/skills/")) return resOK(await S("SkillsService.Delete", decodeURIComponent(p.slice("/api/skills/".length))));
-      if (p.startsWith("/api/config/auth/")) {
-        const prov = decodeURIComponent(p.slice("/api/config/auth/".length));
-        return resOK(await S("ConfigService.AuthDelete", prov));
-      }
-      if (p.startsWith("/api/config/models/")) {
-        const segs = p.slice("/api/config/models/".length).split("/").map(decodeURIComponent);
-        if (segs.length === 2) return resOK(await S("ConfigService.ModelsDelete", segs[0], segs[1]));
-      }
-      if (p.startsWith("/api/mesh/forwards/")) { await S("MeshService.ForwardRemove", decodeURIComponent(p.slice("/api/mesh/forwards/".length))); return resOK({ ok: true }); }
-      if (p.startsWith("/api/automations/")) {
-        const rest = p.slice("/api/automations/".length).split("/");
-        const id = decodeURIComponent(rest[0]);
-        if (rest.length === 1) { await S("AutomationsService.Delete", id); return resOK({ ok: true }); }
-      }
-    } else {
-      if (p === "/api/auth/login" || p === "/api/auth/logout") return resOK({ ok: true });
-      if (p === "/api/prompt") { await S("SessionService.Prompt", body.text || "", body.attachments || []); return resOK({ ok: true }); }
-      if (p === "/api/abort") { await S("SessionService.Abort"); return resOK({ ok: true }); }
-      if (p === "/api/compact") { await S("SessionService.Compact"); return resOK({ ok: true }); }
-      if (p === "/api/reload") return resOK(await S("ConfigService.Reload"));
-      if (p === "/api/config/models") return resOK(await S("ConfigService.ModelsUpsert", body, u.searchParams.get("previous") || ""));
-      if (p === "/api/config/auth") return resOK(await S("ConfigService.AuthSet", body.provider || "", body.key || ""));
-      if (p === "/api/automations") return resOK(await S("AutomationsService.Create", body));
-      if (p.startsWith("/api/automations/") && method === "PATCH") {
-        const id = decodeURIComponent(p.slice("/api/automations/".length));
-        return resOK(await S("AutomationsService.Update", id, body));
-      }
-      if (p === "/api/config/settings") {
-        await S("ConfigService.SettingsPut", body);
-        return resOK({ ok: true, restartRequired: true });
-      }
-      if (p === "/api/model") { await S("SessionService.SetModel", body.spec || ""); return resOK({ ok: true }); }
-      if (p === "/api/thinking") { await S("SessionService.SetThinking", body.level || ""); return resOK({ ok: true }); }
-      if (p === "/api/session/new") { await S("SessionService.New", body.cwd || ""); return resOK({ ok: true }); }
-      if (p === "/api/session/switch") { await S("SessionService.Switch", body.id || ""); return resOK({ ok: true }); }
-      if (p === "/api/session/delete") { await S("SessionService.Delete", body.id || ""); return resOK({ ok: true }); }
-      if (p === "/api/session/claim") return resOK({ owned: true, queued: false });
-      if (p === "/api/session/takeover") return resOK({ owned: true, prevOwner: "" });
-      if (p === "/api/turn/edit") { await S("SessionService.TurnEdit", body.seq, body.text || ""); return resOK({ ok: true }); }
-      if (p === "/api/question/answer") { await S("SessionService.QuestionAnswer", body.id || "", body.text || ""); return resOK({ ok: true }); }
-      if (p === "/api/permission/answer") {
-        await S("SessionService.PermissionAnswer", body.id || "", !!body.allowOnce, !!body.allowAlways, !!body.deny);
-        return resOK({ ok: true });
-      }
-      if (p === "/api/permissions") return resOK(await S("ConfigService.PermissionsPut", body));
-      if (p === "/api/mesh/config") return resOK(await S("MeshService.ConfigPut", body));
-      if (p === "/api/mesh/start") { await S("MeshService.Start"); return resOK({ ok: true }); }
-      if (p === "/api/mesh/stop") { await S("MeshService.Stop"); return resOK({ ok: true }); }
-      if (p === "/api/mesh/forwards") { await S("MeshService.ForwardAdd", body); return resOK({ ok: true }); }
-      if (p === "/api/mcp/reconnect") { await S("McpService.Reconnect", body.server || ""); return resOK({ ok: true }); }
-      if (p === "/api/mcp/enable") { await S("McpService.Enable", body.server || ""); return resOK({ ok: true }); }
-      if (p === "/api/mcp/disable") { await S("McpService.Disable", body.server || ""); return resOK({ ok: true }); }
-      if (p === "/api/mcp/reload") { await S("McpService.Reload"); return resOK({ ok: true }); }
-      if (p === "/api/mcp/servers") { await S("McpService.UpsertServers", body); return resOK({ ok: true }); }
-      if (p === "/api/session/mcp") return resOK(await S("McpService.SessionSet", !!body.enabled));
-      if (p === "/api/uploads/x/apply") { /* 占位，真实 id 走前缀分支 */ }
-      if (p.startsWith("/api/mcp/servers/")) {
-        const segs = p.slice("/api/mcp/servers/".length).split("/");
-        if (segs.length === 2 && segs[1] === "direct") { await S("McpService.ServerDirect", decodeURIComponent(segs[0]), !!body.enabled); return resOK({ ok: true }); }
-        if (segs.length === 2 && segs[1] === "autostart") { await S("McpService.ServerAutoStart", decodeURIComponent(segs[0]), !!body.enabled); return resOK({ ok: true }); }
-      }
-      if (p.startsWith("/api/skills/") && p.endsWith("/enabled")) {
-        const name = decodeURIComponent(p.slice("/api/skills/".length, -"/enabled".length));
-        return resOK(await S("SkillsService.SetEnabled", name, !!body.enabled));
-      }
-      if (p.startsWith("/api/uploads/") && p.endsWith("/apply")) {
-        const id = decodeURIComponent(p.slice("/api/uploads/".length, -"/apply".length));
-        return resOK(await S("UploadsService.Apply", id, body.kind || "", !!body.confirm));
-      }
-      if (p.startsWith("/api/automations/")) {
-        const rest = p.slice("/api/automations/".length).split("/");
-        const id = decodeURIComponent(rest[0]);
-        if (rest.length === 2 && rest[1] === "run") return resOK(await S("AutomationsService.Run", id));
-        if (rest.length === 2 && rest[1] === "enable") return resOK(await S("AutomationsService.SetEnabled", id, true));
-        if (rest.length === 2 && rest[1] === "disable") return resOK(await S("AutomationsService.SetEnabled", id, false));
-      }
-      if (p.startsWith("/api/mesh/forwards/")) {
-        const rest = p.slice("/api/mesh/forwards/".length).split("/");
-        if (rest.length === 2 && (rest[1] === "enable" || rest[1] === "disable")) {
-          await S("MeshService.ForwardSetEnabled", decodeURIComponent(rest[0]), rest[1] === "enable");
-          return resOK({ ok: true });
-        }
-      }
-    }
-    console.warn("[desktop] 未接线的 API 调用：", method, path);
-    return resErr(404, "not wired: " + method + " " + p);
-  } catch (e) {
-    return resErr(kindStatus(e.kind), e.message || String(e));
-  }
-}
-
 const state = {
   connected: false,
   busy: false,
@@ -206,7 +33,6 @@ const state = {
   question: null,
   readOnly: false,
   retry: 0,
-  ws: null,
   sessionId: "",
   cwd: "",
   globalCwd: "",     // 服务进程启动目录（新会话不选项目时的落点）
@@ -230,10 +56,28 @@ const state = {
   // pendingUploads are staged uploads (POST /api/uploads) waiting to be sent
   // with the next message: { id, name, size, mimeType }.
   pendingUploads: [],
+  // 转录分片加载（caps.paging 门控）：msgOffset 是本地窗口之前的服务端消息数；
+  // userOffset 是其中 user 消息数（turn/edit 对齐全量转录序号的补齐量）
+  msgOffset: 0,
+  loadingEarlier: false,
+  userOffset: 0,
 };
 
 /* ---------------- auth ---------------- */
 function init() {
+  if (caps.permPolicy) {
+    // ⛨ 权限策略 tab：桌面能力，注入而非写死在共享 HTML 里
+    const btn = document.createElement("button");
+    btn.className = "settings-tab";
+    btn.dataset.tab = "perm";
+    btn.textContent = "⛨ 权限策略";
+    document.querySelector(".settings-tabs").appendChild(btn);
+  }
+  if (!caps.auth) {
+    // 桌面端无登录页：本机进程即可信调用方，直接进应用
+    enterApp();
+    return;
+  }
   // The login form must be wired before any login is attempted: bindEvents
   // only runs after a successful login, so without this the manual login
   // page's submit would just reload the page.
@@ -391,10 +235,12 @@ function bindEvents() {
       .then((r) => setStatusText(r.ok ? "已重载 models/auth/permission 配置" : "重载失败", !r.ok))
       .catch(() => setStatusText("重载配置失败", true));
   });
-  $("#nav-logout").addEventListener("click", async () => {
-    try { await api("/api/auth/logout", { method: "POST" }); } catch (_) {}
-    location.reload();
-  });
+  if (caps.auth) {
+    $("#nav-logout").addEventListener("click", async () => {
+      try { await api("/api/auth/logout", { method: "POST" }); } catch (_) {}
+      location.reload();
+    });
+  }
   // 添加/编辑模型弹窗
   $("#model-form-close").addEventListener("click", () => $("#model-form").classList.add("hidden"));
   $("#mf-cancel").addEventListener("click", () => $("#model-form").classList.add("hidden"));
@@ -427,7 +273,7 @@ function bindEvents() {
     const del = e.target.closest(".si-del");
     if (del) {
       const id = del.dataset.id;
-      if (!(await desktopConfirm("确定删除该会话？此操作不可恢复。"))) return;
+      if (!(await confirmDialog("确定删除该会话？此操作不可恢复。"))) return;
       api("/api/session/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -687,23 +533,17 @@ function permResponse(response) {
   state.permAsk = null;
   $("#perm").classList.add("hidden");
   if (!ask) return;
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({ type: "permission_response", id: ask.id, response }));
-    return;
-  }
-  // 断线兜底：REST 应答（桌面端映射到 SessionService.PermissionAnswer）；
+  // 应答走平台适配层（web: WS 优先 + REST 兜底；desktop: PermissionAnswer 绑定）；
   // 404/409 = 询问已过期
-  api("/api/permission/answer", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(Object.assign({ id: ask.id }, response)),
-  })
-    .then((r) => {
-      if (!r.ok) {
-        setStatusText(r.status === 404 || r.status === 409 ? "权限询问已失效（断线期间过期）" : "权限应答失败", true);
-      }
-    })
-    .catch((e) => setStatusText("权限应答发送失败: " + String(e.message || e), true));
+  answerPermission(ask.id, response).then((res) => {
+    if (res.ok) return;
+    setStatusText(
+      res.expired ? "权限询问已失效（断线期间过期）"
+        : res.error ? "权限应答发送失败: " + res.error
+        : "权限应答失败",
+      true
+    );
+  });
 }
 
 // showQuestion surfaces a pending remote-task question (the master's bridge
@@ -1240,7 +1080,7 @@ async function onMcpAction(e) {
         break;
       }
       case "server-remove": {
-        if (!(await desktopConfirm("从项目 .doge/mcp.json 删除服务器 " + btn.dataset.server + "？（全局/共享配置里的定义不受影响）"))) {
+        if (!(await confirmDialog("从项目 .doge/mcp.json 删除服务器 " + btn.dataset.server + "？（全局/共享配置里的定义不受影响）"))) {
           btn.disabled = false;
           return;
         }
@@ -1996,24 +1836,29 @@ function loadSession() {
   // Loading affordance while the transcript is fetched and rendered: big
   // sessions (remote-task forks especially) take a moment to transfer.
   $("#messages").classList.add("pane-loading");
-  setStatusText("正在加载会话…");
+  if (caps.desktop) setStatusText("正在加载会话…");
   return api("/api/session", { credentials: "same-origin" })
     .then((r) => r.json())
     .then((info) => {
       state.messages = info.messages || [];
-      state.msgOffset = info.earlierCount || 0;
-      // userOffset：加载窗口之前的用户消息数（服务端按全量转录计数）；缺席回退 0
-      state.userOffset = typeof info.userOffset === "number" ? info.userOffset : 0;
+      if (caps.paging) {
+        state.msgOffset = info.earlierCount || 0;
+        // userOffset：加载窗口之前的用户消息数（服务端按全量转录计数）；缺席回退 0
+        state.userOffset = typeof info.userOffset === "number" ? info.userOffset : 0;
+      }
       state.sessionKind = info.kind || "";
       state.sessionSourceName = info.sourceName || "";
       state.sessionSourcePeer = info.sourcePeerId || "";
       renderAll();
       clearSwitching(); // 会话加载完成，切换守卫即使 session_reset 丢失也能解除
     })
-    .catch((e) => setStatusText("加载会话失败：" + String((e && e.message) || e), true))
+    .catch((e) => {
+      // 桌面端给粘性提示；web 静默（5s 轮询与重连自愈）
+      if (caps.desktop) setStatusText("加载会话失败：" + String((e && e.message) || e), true);
+    })
     .finally(() => {
       $("#messages").classList.remove("pane-loading");
-      if (!sbSticky) setStatusText(""); // 加载失败时保留粘性错误
+      if (caps.desktop && !sbSticky) setStatusText(""); // 加载失败时保留粘性错误
     });
 }
 
@@ -2054,61 +1899,23 @@ function fetchStatus() {
 }
 
 /* ---------------- websocket ---------------- */
+// connectWS 建立 console 事件流：传输差异在平台适配层（web: 真 WebSocket +
+// 指数退避重连；desktop: wails Events + 快照续接），onFrame 收已解析帧。
 function connectWS() {
-  // 桌面端：无 WebSocket——事件经 wails Events 注入，"连接"即拉快照续接视图
-  const sock = {
-    readyState: 1,
-    onopen: null,
-    onmessage: null,
-    onclose: null,
-    send(data) {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.type === "permission_response" && msg.id) {
-          const r = msg.response || {};
-          Call.ByName(
-            "doge/desktop/services.SessionService.PermissionAnswer",
-            msg.id, !!r.allowOnce, !!r.allowAlways, !!r.deny
-          ).catch(() => {});
-        }
-      } catch (_) { /* 忽略非法帧 */ }
-    },
-  };
-  state.ws = sock;
-  // 处理函数与 webui 的真 WebSocket 完全一致（此前漏挂导致事件帧无人处理）
-  sock.onopen = () => {
-    state.connected = true;
-    state.retry = 0;
-    $("#conn-dot").className = "status-dot on";
-    // 断线期间保留的权限/提问弹窗重挂（应答走 fake socket / REST 兜底）
-    if (state.permAsk) showPermAsk(state.permAsk);
-    if (state.question) showQuestion({ question: state.question });
-    // 重连即视图重建，切换守卫不再等可能丢失的 session_reset
-    clearSwitching();
-  };
-  sock.onmessage = (e) => {
-    let msg;
-    try { msg = JSON.parse(e.data); } catch (_) { return; }
-    handleEvent(msg);
-  };
-  sock.onclose = () => {
-    state.connected = false;
-    $("#conn-dot").className = "status-dot off";
-  };
-  (async () => {
-    if (sock.onopen) sock.onopen();
-    try {
-      const snap = await Call.ByName("doge/desktop/services.SessionService.Snapshot");
-      if (sock.onmessage) sock.onmessage({ data: JSON.stringify(snap) });
-    } catch (_) { /* 快照失败：事件流随后补齐 */ }
-  })();
-  Events.On("console", (ev) => {
-    try {
-      if (sock.onmessage) sock.onmessage({ data: JSON.stringify(ev.data) });
-    } catch (e) {
-      try { Events.Emit("js:err", "handleFrame: " + String((e && e.stack) || e)); } catch (_) {}
+  connect(
+    (frame) => handleEvent(frame),
+    (online) => {
+      state.connected = online;
+      $("#conn-dot").className = "status-dot " + (online ? "on" : "off");
+      if (!online) return;
+      state.retry = 0;
+      // 断线期间保留的权限/提问弹窗重挂（此后应答仍优先走 socket，失败落 REST）
+      if (state.permAsk) showPermAsk(state.permAsk);
+      if (state.question) showQuestion({ question: state.question });
+      // 重连即视图重建，切换守卫不再等可能丢失的 session_reset
+      clearSwitching();
     }
-  });
+  );
 }
 
 /* ---------------- event handling ---------------- */
@@ -2127,9 +1934,11 @@ function handleEvent(m) {
       // 快照即视图重建：切换守卫不再等可能丢失的 session_reset
       clearSwitching();
       state.messages = m.messages || [];
-      state.msgOffset = m.earlierCount || 0;
-      // 快照携带 userOffset（窗口之前的用户消息数）则采用，缺席保留现值
-      if (typeof m.userOffset === "number") state.userOffset = m.userOffset;
+      if (caps.paging) {
+        state.msgOffset = m.earlierCount || 0;
+        // 快照携带 userOffset（窗口之前的用户消息数）则采用，缺席保留现值
+        if (typeof m.userOffset === "number") state.userOffset = m.userOffset;
+      }
       state.streaming = m.streaming ? (m.streamingMessage || { role: "assistant", content: [] }) : null;
       if (m.sessionId) state.sessionId = m.sessionId;
       setBusy(!!m.streaming);
@@ -2381,7 +2190,7 @@ function renderAll() {
   const dist = host.scrollHeight - host.scrollTop - host.clientHeight;
   host.textContent = "";
   state.msgEls = new Map();
-  if (state.msgOffset > 0) {
+  if (caps.paging && state.msgOffset > 0) {
     const earlierBtn = document.createElement("button");
     earlierBtn.className = "earlier-btn";
     earlierBtn.textContent = "↑ 加载更早（" + state.msgOffset + " 条）";
@@ -3093,7 +2902,8 @@ function claimControl() {
 // deliberately take over instead of waiting forever for the old owner.
 function setReadOnly(readOnly) {
   state.readOnly = readOnly;
-  $("#takeover-btn").classList.toggle("hidden", !readOnly);
+  // 夺取按钮属 auth/多窗口仲裁能力（桌面单窗口后端恒 writable，按钮不出现）
+  $("#takeover-btn").classList.toggle("hidden", !readOnly || !caps.auth);
 }
 
 // takeoverControl explicitly, deliberately forces write control of the current
@@ -3101,7 +2911,7 @@ function setReadOnly(readOnly) {
 // a window that is blocked/queued does not have to hunt down which window
 // holds the lock.
 async function takeoverControl() {
-  if (!(await desktopConfirm("强制夺取将立即释放当前持有窗口对本会话的控制权，由本窗口接管。确定？"))) {
+  if (!(await confirmDialog("强制夺取将立即释放当前持有窗口对本会话的控制权，由本窗口接管。确定？"))) {
     return;
   }
   api("/api/session/takeover", { method: "POST" })
@@ -3138,7 +2948,7 @@ async function installSkillZip(file) {
       body: JSON.stringify({ kind: "skills-zip" }),
     }).then((r) => r.json());
     if (!dry.ok) throw new Error(dry.error || "解析失败");
-    if (!(await desktopConfirm(dry.diff + "\n\n安装到全局技能目录并热刷新？"))) return;
+    if (!(await confirmDialog(dry.diff + "\n\n安装到全局技能目录并热刷新？"))) return;
     const done = await api(applyURL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3279,7 +3089,7 @@ function skillRow(sk, installed) {
     del.textContent = "✕";
     del.title = "删除该技能目录（不可恢复）";
     del.addEventListener("click", async () => {
-      if (!(await desktopConfirm("删除技能 " + sk.name + "？其目录将被移除，不可恢复。"))) return;
+      if (!(await confirmDialog("删除技能 " + sk.name + "？其目录将被移除，不可恢复。"))) return;
       del.disabled = true;
       try {
         const r = await api("/api/skills/" + encodeURIComponent(sk.name), { method: "DELETE" });
@@ -3296,7 +3106,10 @@ function skillRow(sk, installed) {
 }
 
 /* ---------------- 设置中心：模型 / MCP / 技能 ---------------- */
-const settingsTabs = { models: "模型", keys: "密钥", auto: "定时任务", mcp: "MCP 服务器", skills: "技能", mesh: "Mesh 网络", perm: "权限策略" };
+const settingsTabs = Object.assign(
+  { models: "模型", keys: "密钥", auto: "定时任务", mcp: "MCP 服务器", skills: "技能", mesh: "Mesh 网络" },
+  caps.permPolicy ? { perm: "权限策略" } : {} // ⛨ 权限策略（桌面能力）
+);
 let settingsModelProvider = ""; // 模型 tab 当前选中的 provider
 
 function openSettings(tab) {
@@ -3312,8 +3125,11 @@ function openSettings(tab) {
   else if (tab === "keys") loadSettingsKeys();
   else if (tab === "auto") loadSettingsAuto();
   else if (tab === "mcp") openMcp();
-  else if (tab === "mesh") openMeshDesktop();
-  else if (tab === "perm") loadSettingsPerm();
+  else if (tab === "mesh") {
+    if (caps.meshControl) openMeshDesktop(); // 桌面：运行开关 + 权限配置
+    else openMesh();
+  }
+  else if (tab === "perm") loadSettingsPerm(); // 仅 caps.permPolicy 时可进入
   else openSkills();
 }
 
@@ -3402,7 +3218,7 @@ function renderSettingsModels(custom) {
   addProv.textContent = "＋ 添加供应商";
   addProv.title = "新增一个自定义供应商，随第一个模型一起保存";
   addProv.addEventListener("click", async () => {
-    const name = await desktopPrompt("新供应商名称（provider 标识）");
+    const name = await promptDialog("新供应商名称（provider 标识）");
     if (!name || !name.trim()) return;
     settingsModelProvider = name.trim();
     openModelForm(null, customMap, name.trim());
@@ -3475,7 +3291,7 @@ function modelRow(m, custom) {
   del.textContent = "删除";
   if (custom) {
     del.addEventListener("click", async () => {
-      if (!(await desktopConfirm("删除模型 " + m.provider + "/" + m.id + "？"))) return;
+      if (!(await confirmDialog("删除模型 " + m.provider + "/" + m.id + "？"))) return;
       del.disabled = true;
       api("/api/config/models/" + encodeURIComponent(m.provider) + "/" + encodeURIComponent(m.id), { method: "DELETE" })
         .then(async (r) => {
@@ -4106,7 +3922,7 @@ function keyRow(p, authEntry, count, models, providers) {
   del.textContent = "删除";
   if (authEntry) {
     del.addEventListener("click", async () => {
-      if (!(await desktopConfirm("删除 " + (p.name || p.id) + " 的密钥？"))) return;
+      if (!(await confirmDialog("删除 " + (p.name || p.id) + " 的密钥？"))) return;
       del.disabled = true;
       api("/api/config/auth/" + encodeURIComponent(p.id), { method: "DELETE" })
         .then(async (r) => {
@@ -4372,7 +4188,7 @@ function autoCard(c, reload) {
   const del = document.createElement("button");
   del.textContent = "删除";
   del.addEventListener("click", async () => {
-    if (!(await desktopConfirm("删除定时任务「" + (c.title || c.id) + "」？"))) return;
+    if (!(await confirmDialog("删除定时任务「" + (c.title || c.id) + "」？"))) return;
     del.disabled = true;
     api("/api/automations/" + encodeURIComponent(c.id), { method: "DELETE" })
       .then(async (r) => {
@@ -4842,30 +4658,17 @@ function followScroll(mut) {
 
 document.addEventListener("DOMContentLoaded", init);
 
-/* ============================ desktop 定制 ============================ */
+/* ==================== 桌面专属 UI（caps 门控，共享内核随包分发） ==================== */
 
-document.body.classList.add("desktop");
-
-// Go 菜单/托盘经 ExecJS 调用这里，复用页面自身的事件绑定
-window.dogeMenu = {
-  newTask: () => $("#sb-new").click(),
-  abort: () => $("#abort-btn").click(),
-  openSettings: () => $("#settings-btn").click(),
-  reloadConfig: () => $("#nav-reload").click(),
-};
-
-/* ============ desktop：转录分片加载（大转录防冻结） ============ */
-state.msgOffset = 0;
-state.loadingEarlier = false;
-// userOffset：加载窗口之前（更早分片里）的用户消息数，turn/edit 提交时补上，
-// 使本地窗口序号对齐服务端的全量转录序号；服务端不给该字段时保持 0（旧行为）
-state.userOffset = 0;
+/* ===== 转录分片加载（caps.paging：大转录防冻结，msgOffset/userOffset 见 state） ===== */
 
 // 上滑到顶部自动加载更早消息（无需手动点按钮）
-$("#messages").addEventListener("scroll", () => {
-  const m = $("#messages");
-  if (m.scrollTop < 120 && state.msgOffset > 0 && !state.loadingEarlier) loadEarlier();
-});
+if (caps.paging) {
+  $("#messages").addEventListener("scroll", () => {
+    const m = $("#messages");
+    if (m.scrollTop < 120 && state.msgOffset > 0 && !state.loadingEarlier) loadEarlier();
+  });
+}
 
 function loadEarlier() {
   if (state.msgOffset <= 0 || state.loadingEarlier) return;
@@ -4897,58 +4700,7 @@ function loadEarlier() {
     });
 }
 
-/* ===== desktop：confirm/prompt 替身（WKWebView 未实现 JS 弹窗委托，
-   原生 confirm 恒返回 false 导致所有删除/确认静默失效） ===== */
-function desktopModal(opts) {
-  // opts: { title, message, input, defaultValue } → Promise<bool | string | null>
-  return new Promise((resolve) => {
-    const box = document.createElement("div");
-    box.className = "modal";
-    const inner = document.createElement("div");
-    inner.className = "modal-box";
-    const h = document.createElement("h3");
-    h.textContent = opts.title || "确认";
-    inner.appendChild(h);
-    if (opts.message) {
-      const msg = document.createElement("div");
-      msg.className = "desktop-modal-msg";
-      msg.textContent = opts.message;
-      inner.appendChild(msg);
-    }
-    let inp = null;
-    if (opts.input) {
-      inp = document.createElement("input");
-      inp.value = opts.defaultValue || "";
-      inp.spellcheck = false;
-      inner.appendChild(inp);
-    }
-    const actions = document.createElement("div");
-    actions.className = "modal-actions";
-    const cancel = document.createElement("button");
-    cancel.textContent = "取消";
-    const ok = document.createElement("button");
-    ok.className = "primary";
-    ok.textContent = "确定";
-    actions.append(cancel, ok);
-    inner.appendChild(actions);
-    box.appendChild(inner);
-    document.body.appendChild(box);
-    const done = (v) => { box.remove(); resolve(v); };
-    cancel.onclick = () => done(opts.input ? null : false);
-    ok.onclick = () => done(opts.input ? inp.value : true);
-    box.addEventListener("keydown", (e) => {
-      // 忽略 IME 选词回车（对齐主输入框的 isComposing / keyCode 229 守卫）
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); ok.click(); }
-      if (e.key === "Escape") done(opts.input ? null : false);
-    });
-    (inp || ok).focus();
-  });
-}
-const desktopConfirm = (msg) => desktopModal({ title: "确认", message: msg });
-const desktopPrompt = (msg, def) => desktopModal({ title: "输入", message: msg, input: true, defaultValue: def });
-
-
-/* ==================== ⛨ 权限策略 tab + Mesh 开关/权限（桌面专属） ==================== */
+/* ==================== ⛨ 权限策略 tab + Mesh 开关/权限（caps 门控） ==================== */
 
 /* ---------- 卡片式表单构件 ---------- */
 
@@ -5177,7 +4929,7 @@ async function loadSettingsPerm() {
     save.disabled = true;
     try {
       const j = await api("/api/permissions", {
-        method: "POST",
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(policy),
       }).then((r) => r.json());

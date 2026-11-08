@@ -19,12 +19,13 @@ import (
 	"doge/internal/coding"
 	"doge/internal/coding/uploads"
 	"doge/internal/web"
+	"doge/internal/webui"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 //go:embed frontend
-var frontendFS embed.FS
+var overlayFS embed.FS
 
 //go:embed assets
 var assetsFS embed.FS
@@ -152,14 +153,15 @@ func mainWindow() application.WebviewWindowOptions {
 	}
 }
 
-// assetsHandler 资产服务：静态前端 + 附件内容直出（转录图片直显与下载走
-// 同一条 wails 资产通道，前端 <img>/<a> 无需改造）
+// assetsHandler 资产服务：union 静态前端（桌面 overlay 优先、共享内核 webui.FS
+// 兜底）+ 附件内容直出（转录图片直显与下载走同一条 wails 资产通道，前端
+// <img>/<a> 无需改造）
 func assetsHandler(up *uploads.Store) http.Handler {
-	sub, err := fs.Sub(frontendFS, "frontend")
+	overlay, err := fs.Sub(overlayFS, "frontend")
 	if err != nil {
 		panic(err)
 	}
-	static := application.BundledAssetFileServer(sub)
+	static := application.BundledAssetFileServer(webui.Union(overlay))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if up != nil && strings.HasPrefix(r.URL.Path, "/api/uploads/") && strings.HasSuffix(r.URL.Path, "/content") {
 			rest := strings.TrimPrefix(r.URL.Path, "/api/uploads/")

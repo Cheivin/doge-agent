@@ -288,6 +288,20 @@ doge --web --no-tui --web-cors '*'                      # 允许所有来源
 夺取成功会向**所有**窗口广播 `{"type":"session_control","key":"<会话路径>","owner":"<新持有者>"}`，
 让被夺方的 UI 立刻变为只读（可继续轮询 `GET /api/status` 确认 `writable`）。
 
+#### GET /api/session/messages?before=&limit=
+
+转录分片加载（大转录按需取头部；与桌面端绑定同形状）。`before` 为窗口起点
+（返回该序号**之前**的消息，缺省/越界按转录长度处理），`limit` 每批条数
+（缺省 30，上限 100）。响应：
+
+```json
+{ "messages": [Message...], "offset": 120, "userOffset": 34 }
+```
+
+`offset` 是本批首条在**全量转录**中的序号（下一批的 `before`）；`userOffset`
+是本批之前未加载消息里的 user 条数——`POST /api/turn/edit` 的 `seq` 按**全量
+转录**数 user 消息，前端以 `userOffset + 本地窗口序号` 回传对齐。
+
 ### 4.6 配置
 
 #### POST /api/reload
@@ -448,6 +462,25 @@ v5 起 mesh 文件传输配置随快照带出：`allowRemoteFiles`（默认 fals
 #### DELETE /api/mesh/forwards/{name}
 
 停机并删除规则（持久化到 mesh.json）。响应：`200`；`404`。
+
+#### GET /api/mesh/running 、 POST /api/mesh/start 、 POST /api/mesh/stop
+
+节点运行时开关（桌面能力反向赋能；与 forwards 端点不同，它们需要宿主注入
+节点运行时——web 宿主可能只持只读 MeshView）：
+
+- `GET /api/mesh/running` → `200 {"running": true|false}`；无运行时 `503`。
+- `POST /api/mesh/start` → `200 {"ok":true}`；启动失败 `400`（如 mesh.json 无
+  token）；无运行时 `503`。
+- `POST /api/mesh/stop` → `200 {"ok":true}`；未运行 `404`；无运行时 `503`。
+
+#### GET /api/mesh/config 、 POST /api/mesh/config
+
+mesh.json 读写（文件级操作，不要求节点已运行；桌面能力反向赋能）：
+
+- `GET` → `200 {"config": { ...mesh.json 全量（含 token）... }, "path": "<绝对路径>"}`。
+- `POST`：请求体为完整 mesh.json 配置对象，`token` 留空保留磁盘现值；保存后
+  运行中的节点自动重启生效。响应 `200 {"ok":true,"restarted":true|false}`；
+  校验/写盘失败 `200 {"ok":false,"error":"..."}`（与桌面绑定同形状）。
 
 ### 4.9 进程管理（v2 新增）
 
@@ -784,6 +817,27 @@ apply。未知 kind → `400`。
 automationId, trigger: "schedule"|"manual", scheduledAt, startedAt, finishedAt,
 outcome: "running"|"succeeded"|"failed"|"stopped"|"skipped", session, summary,
 error}`——完整转录即该 session 的会话 JSONL，台账只存摘要。
+
+### 4.15 权限策略（桌面能力反向赋能）
+
+全局权限策略 `~/.doge/agent/permissions.json` 的查看与编辑（校验 + `.bak`
+备份 + 全局热重载，无需重启）。请求/响应的 `policy` 形状与权限层一致
+（`defaultPolicy` / `special` / `autoDecide` / `llmApproval` / `humanOnly` /
+`tools` / `bash`）。
+
+#### GET /api/permissions
+
+`200 {"policy": {...}, "path": "<permissions.json 绝对路径>"}`；文件不存在时
+`policy` 为空对象。
+
+#### PUT /api/permissions
+
+请求体为完整 policy 对象。响应：
+
+- 成功：`200 {"ok":true,"reloaded":true}`；
+- 保存成功但热重载失败：`200 {"ok":true,"reloaded":false,"error":"..."}`；
+- 校验/写盘失败：`200 {"ok":false,"reloaded":false,"error":"..."}`（与桌面
+  绑定同形状，前端按 `ok === false` 分支提示）。
 
 ## 5. 数据模型
 
@@ -1169,6 +1223,10 @@ WS 断线后服务端不保留该窗口的推送状态，客户端应**指数退
 | mesh 转发规则管理 | `/api/mesh/forwards` 系列 | 可选（mesh 场景） |
 | MCP 服务器管理 | `GET /api/mcp`、`/api/mcp/reconnect|enable|disable|reload|servers` | 可选（MCP 场景） |
 | 会话级 MCP 启停 | `GET/POST /api/session/mcp` + reload 落地 | 可选（普通会话） |
+| 转录分片加载 | `GET /api/session/messages?before=&limit=` | 可选（大转录） |
+| 权限策略编辑 | `GET/PUT /api/permissions`（校验+备份+热重载） | 可选（管理面板） |
+| mesh 运行开关 | `GET /api/mesh/running`、`POST /api/mesh/start|stop`（需宿主注入运行时，无则 503） | 可选（mesh 场景） |
+| mesh.json 读写 | `GET/POST /api/mesh/config`（token 留空保留现值） | 可选（mesh 场景） |
 | 远程关停节点 | `POST /api/shutdown` | 可选（多节点管理） |
 
 ## 10. 注意事项

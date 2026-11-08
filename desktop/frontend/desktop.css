@@ -1,0 +1,145 @@
+
+/* ===== desktop 定制：token 随进程生成，登出后无法重登，隐藏登出入口 ===== */
+.desktop #nav-logout { display: none; }
+
+/* ===== desktop：分片加载与加载态反馈强化 ===== */
+#messages.pane-loading::after {
+  content: "正在加载会话…" !important;
+  color: var(--fg-dim) !important;
+}
+.earlier-btn {
+  display: block;
+  margin: 4px auto 16px;
+  padding: 6px 18px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius);
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.earlier-btn:hover { color: var(--fg); background: var(--bg-elev3); }
+
+/* ===== desktop：消息区左右边距加宽 ===== */
+.turn,
+#live {
+  padding-left: 56px !important;
+  padding-right: 56px !important;
+}
+#composer {
+  padding-left: 56px !important;
+  padding-right: 56px !important;
+}
+
+/* ===== desktop：confirm/prompt 替身模态的消息区 ===== */
+.desktop-modal-msg {
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg-dim);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+/* ===== desktop：设置面板卡片化（权限策略 / Mesh 权限） ===== */
+.dsec {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 22px;
+  margin-bottom: 16px;
+  max-width: 860px;
+}
+.dsec-head { margin-bottom: 10px; }
+.dsec-title { font-size: 14px; font-weight: 600; color: var(--fg); }
+.dsec-sub { font-size: 12px; color: var(--fg-faint); margin-top: 3px; }
+.dsec-note { color: var(--fg-faint); font-size: 12px; margin: 0 0 14px; }
+
+.drow {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.drow:last-child { border-bottom: none; }
+.drow-label { width: 260px; flex: none; font-size: 13px; color: var(--fg-dim); }
+.drow-label .dsub { display: block; font-size: 11px; color: var(--fg-faint); margin-top: 2px; font-family: var(--mono); }
+.drow-ctrl { flex: 1; display: flex; align-items: center; min-width: 0; }
+.drow-ctrl select,
+.drow-ctrl input[type="number"],
+.drow-ctrl input[type="text"] {
+  width: 220px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: var(--fg);
+}
+.drow-ctrl input:focus, .drow-ctrl select:focus { border-color: var(--accent-dim); }
+.drow-ctrl .dtextarea { width: 100%; }
+
+.dswitch { position: relative; width: 40px; height: 22px; flex: none; display: inline-block; }
+.dswitch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.dswitch i {
+  position: absolute; inset: 0; border-radius: 11px;
+  background: var(--bg-elev3); border: 1px solid var(--border-2);
+  transition: background 0.15s, border-color 0.15s;
+  pointer-events: none;
+}
+.dswitch i::after {
+  content: "";
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--fg-dim);
+  transition: left 0.15s, background 0.15s;
+}
+.dswitch input:checked + i { background: var(--accent-dim); border-color: var(--accent); }
+.dswitch input:checked + i::after { left: 20px; background: #fff; }
+
+.drules { display: flex; flex-direction: column; gap: 8px; }
+.drule-row {
+  display: flex; gap: 12px; align-items: center;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.drule-row input {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: var(--fg); font-family: var(--mono); font-size: 12.5px; padding: 2px 4px;
+}
+.drule-row input::placeholder { color: var(--fg-faint); }
+.drule-row select {
+  width: 140px; flex: none; background: var(--bg-elev3);
+  border: 1px solid var(--border-2); border-radius: 6px;
+  padding: 5px 8px; color: var(--fg); font-size: 12.5px;
+}
+.drule-row button {
+  flex: none; width: 26px; height: 26px; border-radius: 50%;
+  background: transparent; border: none;
+  color: var(--fg-faint); font-size: 13px; cursor: pointer; padding: 0;
+}
+.drule-row button:hover { color: var(--err); background: rgba(239, 68, 68, 0.12); }
+.drule-add {
+  width: 100%; padding: 9px; background: transparent;
+  border: 1px dashed var(--border-2); border-radius: 8px;
+  color: var(--fg-faint); cursor: pointer; font-size: 12.5px;
+}
+.drule-add:hover { color: var(--accent); border-color: var(--accent-dim); background: rgba(14, 165, 233, 0.06); }
+
+.dtextarea {
+  min-height: 84px;
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--fg);
+  resize: vertical;
+}
+
