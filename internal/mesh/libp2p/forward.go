@@ -122,8 +122,16 @@ func (m *meshNode) ForwardList() []mesh.ForwardRule {
 	return out
 }
 
-// forwardStart registers/starts a rule and stores its handle.
+// forwardStart registers/starts a rule and stores its handle. 同名规则先停
+// 旧句柄再启动：直接覆盖会让旧 handler/listener 永久失去停止入口（泄漏）。
+// 先 stop 后 start 的顺序保证 expose 的 proto 不会先注册新再被旧 stop 拆掉
 func (m *meshNode) forwardStart(rule mesh.ForwardRule) error {
+	m.fwMu.Lock()
+	old := m.forwards[rule.Name]
+	m.fwMu.Unlock()
+	if old != nil {
+		m.forwardStop(old)
+	}
 	fw := &forwardHandle{rule: rule, stop: make(chan struct{})}
 	switch rule.Mode {
 	case "expose":

@@ -115,8 +115,10 @@ func RemoteAgentTool(m mesh.Mesh, b *Bridge, sess *coding.AgentSession) *agent.A
 			taskID := newID()
 			// Route this task's questions to the dispatching session, so a
 			// slave asking for permission mid-run reaches the window the user
-			// is viewing (not blocked by this sync wait).
+			// is viewing (not blocked by this sync wait). 派发对端一并登记：
+			// 回包（result/question/error）只接受该 peer
 			b.SetTaskSession(taskID, sess)
+			b.SetTaskPeer(taskID, peer)
 			// Session strategy: by default REUSE this master session's most
 			// recent remote-task session with the peer (keyed per master
 			// session, so two sessions dispatching to the same node each keep
@@ -141,19 +143,31 @@ func RemoteAgentTool(m mesh.Mesh, b *Bridge, sess *coding.AgentSession) *agent.A
 				tp.Snapshot = snap
 			}
 			payload, _ := json.Marshal(tp)
-			if err := m.Send(peer, mesh.Envelope{Type: mesh.MsgTask, ID: taskID, To: peer, Payload: payload}); err != nil {
-				return tools.ToolError("remote_agent: dispatch to " + peer + " failed: " + err.Error()), nil
-			}
 
 			// 3. Async: register (with the dispatching session as the follow-up
-			// target) and return immediately. The registry watchdog uses the
-			// same timeout, so a lost result never shows "running" forever.
+			// target) BEFORE sending — a fast result must find its inflight
+			// entry already in place. The registry watchdog uses the same
+			// timeout, so a lost result never shows "running" forever.
+			// sync 则预注册 waiter（快速拒绝不丢）；async 不注册 waiter，
+			// 否则结果会被无人读取的 channel 吞掉
 			timeout := time.Duration(timeoutSec) * time.Second
 			if timeout <= 0 {
 				timeout = defaultSyncTimeout
 			}
 			if async {
 				b.RegisterInflight(taskID, peer, truncateTask(task), sess, timeout)
+			} else {
+				b.armWaiter(taskID, peer)
+			}
+			if err := m.Send(peer, mesh.Envelope{Type: mesh.MsgTask, ID: taskID, To: peer, Payload: payload}); err != nil {
+				if async {
+					b.dropInflight(taskID)
+				} else {
+					b.forgetTaskSession(taskID)
+				}
+				return tools.ToolError("remote_agent: dispatch to " + peer + " failed: " + err.Error()), nil
+			}
+			if async {
 				return tools.ToolResult(fmt.Sprintf("Remote task dispatched to %s (async). task=%s You will be notified when it completes; use remote_agent_status to check.", peer, taskID)), nil
 			}
 

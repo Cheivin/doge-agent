@@ -53,6 +53,9 @@ func RemoteTool(m mesh.Mesh, b *Bridge) *agent.AgentTool {
 			}
 			callID := newID()
 			payload, _ := json.Marshal(mesh.ToolCallPayload{Tool: tool, Args: args})
+			// 先注册 waiter 与派发对端再发送：快速拒绝（denied/busy）不会
+			// 在 waiter 就位前到达被丢弃；回包只接受该 peer
+			b.armWaiter(callID, peer)
 			if err := m.Send(peer, mesh.Envelope{Type: mesh.MsgToolCall, ID: callID, To: peer, Payload: payload}); err != nil {
 				return tools.ToolError(fmt.Sprintf("remote_tool: send to %s failed: %s (peer disconnected? it should reconnect automatically within seconds)", peer, err)), nil
 			}

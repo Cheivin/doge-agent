@@ -31,6 +31,10 @@ const (
 	// mesh panel and remote_agent_status show it; the full result travels via
 	// the follow-up message, not here).
 	inflightProgressMax = 400
+
+	// questionConcurrency 同时解析的 slave 提问上限（人类应答/LLM 兜底都可能
+	// 长阻塞，无上限会被 flood 占满 goroutine 与 LLM 预算）
+	questionConcurrency = 4
 )
 
 // asyncResultGrace is the slack added to a task's timeout before the async
@@ -82,6 +86,13 @@ type Bridge struct {
 	// actually viewing) instead of the node's shared session. Sync tasks have
 	// no in-flight entry, hence this separate map.
 	taskSessions map[string]*coding.AgentSession
+	// taskPeers 记录任务派发对端：result/question/error 只接受派发对端的
+	// 回包——不校验则任意同 token 节点可伪造结果注入会话、或伪造提问触发
+	// LLM 调用（token 消耗 DoS）
+	taskPeers map[string]string
+
+	// qsem 并发的 slave 提问解析上限（每条起 goroutine，无上限被 flood 占满）
+	qsem chan struct{}
 
 	// peerSession records, per MASTER session and peer, the most recent
 	// remote-task session used, so remote_agent defaults to reusing it
@@ -105,11 +116,13 @@ type peerSessionKey struct {
 // self-answers, and the target for async result injection.
 func NewBridge(m mesh.Mesh, sess *coding.AgentSession, qTimeout time.Duration) *Bridge {
 	b := &Bridge{
-		m:        m,
-		sess:     sess,
-		qTimeout: qTimeout,
-		inflight: map[string]*inflightTask{},
-		waiters:  map[string]chan mesh.ResultPayload{},
+		m:         m,
+		sess:      sess,
+		qTimeout:  qTimeout,
+		inflight:  map[string]*inflightTask{},
+		waiters:   map[string]chan mesh.ResultPayload{},
+		taskPeers: map[string]string{},
+		qsem:      make(chan struct{}, questionConcurrency),
 	}
 	if b.qTimeout <= 0 {
 		b.qTimeout = defaultQuestionTimeout
@@ -123,20 +136,65 @@ func (b *Bridge) SetLLMAnswerModel(spec string) { b.llmModel = spec }
 
 // Handle processes envelopes the master role cares about. Question resolution
 // runs in a goroutine so a blocked answer never stalls the stream dispatch.
+// 所有回包信封先过任务来源校验：result/question/error 只接受派发对端，
+// 未知任务直接丢弃（不做回复，避免成为反射放大器）
 func (b *Bridge) Handle(env mesh.Envelope) error {
 	switch env.Type {
 	case mesh.MsgResult:
+		if !b.knownTaskPeer(env.ReplyTo, env.From) {
+			meshLogf("bridge: dropped result for foreign task %q from %s", env.ReplyTo, env.From)
+			return nil
+		}
 		b.onResult(env)
 	case mesh.MsgProgress:
+		if !b.knownTaskPeer(env.ReplyTo, env.From) {
+			return nil
+		}
 		b.onProgress(env)
 	case mesh.MsgQuestion:
-		go b.resolveQuestion(env)
+		if !b.knownTaskPeer(env.ReplyTo, env.From) {
+			meshLogf("bridge: dropped question for foreign task %q from %s", env.ReplyTo, env.From)
+			return nil
+		}
+		select {
+		case b.qsem <- struct{}{}:
+			go func() {
+				defer func() { <-b.qsem }()
+				b.resolveQuestion(env)
+			}()
+		default:
+			b.sendAnswerError(env.From, env.ReplyTo, "too many concurrent questions on this node")
+		}
 	case mesh.MsgToolResult:
+		if !b.knownTaskPeer(env.ReplyTo, env.From) {
+			meshLogf("bridge: dropped tool result for foreign task %q from %s", env.ReplyTo, env.From)
+			return nil
+		}
 		b.onToolResult(env)
 	case mesh.MsgError:
+		if !b.knownTaskPeer(env.ReplyTo, env.From) {
+			return nil
+		}
 		b.onError(env)
 	}
 	return nil
+}
+
+// knownTaskPeer 校验 taskID 是本节点派出的任务且回包来自派发对端。空 taskID
+// 一律拒绝（question/error 都以 ReplyTo 路由）
+func (b *Bridge) knownTaskPeer(taskID, peer string) bool {
+	if taskID == "" || peer == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if in := b.inflight[taskID]; in != nil {
+		return in.peer == peer
+	}
+	if p, ok := b.taskPeers[taskID]; ok {
+		return p == peer
+	}
+	return false
 }
 
 // RegisterInflight records an asynchronous task so remote_agent_status can
@@ -156,9 +214,37 @@ func (b *Bridge) RegisterInflight(taskID, peer, summary string, target *coding.A
 		taskID: taskID, peer: peer, summary: summary,
 		status: "running", dispatched: time.Now(), async: true, target: target,
 	}
+	if b.taskPeers == nil {
+		b.taskPeers = map[string]string{}
+	}
+	b.taskPeers[taskID] = peer
 	b.mu.Unlock()
 	b.persistInflight(taskID, "running")
 	time.AfterFunc(timeout+asyncResultGrace, func() { b.watchdog(taskID, peer) })
+}
+
+// SetTaskPeer 记录 sync 任务的派发对端（async 由 RegisterInflight 记录），
+// 回包来源校验用
+func (b *Bridge) SetTaskPeer(taskID, peer string) {
+	if taskID == "" || peer == "" {
+		return
+	}
+	b.mu.Lock()
+	if b.taskPeers == nil {
+		b.taskPeers = map[string]string{}
+	}
+	b.taskPeers[taskID] = peer
+	b.mu.Unlock()
+}
+
+// dropInflight 撤销刚注册的在途任务（派发发送失败）：内存条目即刻删除，
+// 已持久化的 running 行落 error 终态，避免重启恢复后空等 watchdog
+func (b *Bridge) dropInflight(taskID string) {
+	b.mu.Lock()
+	delete(b.inflight, taskID)
+	delete(b.taskPeers, taskID)
+	b.mu.Unlock()
+	b.persistInflight(taskID, "error")
 }
 
 // watchdog expires an async task whose result never arrived: it marks the
@@ -175,6 +261,8 @@ func (b *Bridge) watchdog(taskID, peer string) {
 	in.progress = "结果超时未返回（连接中断或远端无响应），已向远端发送中断"
 	b.mu.Unlock()
 	b.persistInflight(taskID, "timeout")
+	// 终态化即 forget：迟到的回包按 unknown task 丢弃，taskPeers 不残留
+	b.forgetTaskSession(taskID)
 	_ = b.m.Send(peer, mesh.Envelope{Type: mesh.MsgInterrupt, To: peer, ReplyTo: taskID})
 }
 
@@ -231,6 +319,7 @@ func (b *Bridge) SetTaskSession(taskID string, sess *coding.AgentSession) {
 func (b *Bridge) forgetTaskSession(taskID string) {
 	b.mu.Lock()
 	delete(b.taskSessions, taskID)
+	delete(b.taskPeers, taskID)
 	b.mu.Unlock()
 }
 
@@ -245,17 +334,41 @@ func (b *Bridge) questionTarget(taskID string) *coding.AgentSession {
 	return b.sess
 }
 
-// WaitForResult blocks until the result for taskID arrives (or the timeout
-// elapses, or the run context is canceled — a user abort). MsgError rejections
-// (bad-cwd, denied, busy) arrive through the same channel as an error result,
-// so the caller never waits them out.
-func (b *Bridge) WaitForResult(ctx context.Context, taskID string, timeout time.Duration) (mesh.ResultPayload, error) {
-	ch := make(chan mesh.ResultPayload, 1)
+// armWaiter 预注册结果 waiter 与派发对端：请求发出前调用。先发后注册会让
+// 快速拒绝（denied/busy）在 waiter 就位前到达被丢弃，调用方空等到超时
+func (b *Bridge) armWaiter(taskID, peer string) {
+	if taskID == "" {
+		return
+	}
 	b.mu.Lock()
 	if b.waiters == nil {
 		b.waiters = map[string]chan mesh.ResultPayload{}
 	}
-	b.waiters[taskID] = ch
+	b.waiters[taskID] = make(chan mesh.ResultPayload, 1)
+	if b.taskPeers == nil {
+		b.taskPeers = map[string]string{}
+	}
+	if peer != "" {
+		b.taskPeers[taskID] = peer
+	}
+	b.mu.Unlock()
+}
+
+// WaitForResult blocks until the result for taskID arrives (or the timeout
+// elapses, or the run context is canceled — a user abort). MsgError rejections
+// (bad-cwd, denied, busy) arrive through the same channel as an error result,
+// so the caller never waits them out. 复用 armWaiter 预注册的 channel（不覆盖，
+// 先到的回包不丢）
+func (b *Bridge) WaitForResult(ctx context.Context, taskID string, timeout time.Duration) (mesh.ResultPayload, error) {
+	b.mu.Lock()
+	if b.waiters == nil {
+		b.waiters = map[string]chan mesh.ResultPayload{}
+	}
+	ch, ok := b.waiters[taskID]
+	if !ok {
+		ch = make(chan mesh.ResultPayload, 1)
+		b.waiters[taskID] = ch
+	}
 	b.mu.Unlock()
 	defer func() {
 		b.mu.Lock()

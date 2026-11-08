@@ -249,10 +249,16 @@ func (h *agentHandler) runTask(env mesh.Envelope, tp mesh.TaskPayload, cwd strin
 	if tp.Session != "" {
 		// Task continuity: resume a previous remote-task session. Only sessions
 		// the slave forked for remote tasks (Kind "remote") may be continued —
-		// a remote client can never resume a user's local session.
+		// a remote client can never resume a user's local session. 归属校验：
+		// 记录了创建者的会话只有创建者本人可续（防 peer A 续 peer B 的会话
+		// 读其转录）；旧版本会话无 SourcePeerID，保持可续（兼容）
 		target, err := h.sess.ResolveSession(tp.Session)
 		if err != nil || target.Header.Kind != coding.SessionKindRemote {
 			h.sendError(env.From, taskID, "bad-session", "no prior remote-task session "+tp.Session)
+			return
+		}
+		if owner := target.Header.SourcePeerID; owner != "" && owner != env.From {
+			h.sendError(env.From, taskID, "denied", "remote-task session "+tp.Session+" belongs to another peer")
 			return
 		}
 		sess, err = h.sess.ForkRemoteTo(target, level, model, contact)
@@ -575,12 +581,21 @@ func compressSnapshot(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// decompressSnapshot 解压 compressSnapshot 的结果
+// decompressSnapshot 解压 compressSnapshot 的结果。gzip 炸弹防护：16 MiB 的
+// wire 帧可解压出 GB 级内存，解压上限取帧上限的 8 倍（远大于正常快照——
+// 压缩率到不了 8:1 以下的 JSON 会话转录）
 func decompressSnapshot(data []byte) ([]byte, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: %w", err)
 	}
 	defer zr.Close()
-	return io.ReadAll(zr)
+	raw, err := io.ReadAll(io.LimitReader(zr, maxFrameBytes*8+1))
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: %w", err)
+	}
+	if len(raw) > maxFrameBytes*8 {
+		return nil, fmt.Errorf("snapshot decompressed beyond %d bytes (gzip bomb?)", maxFrameBytes*8)
+	}
+	return raw, nil
 }
