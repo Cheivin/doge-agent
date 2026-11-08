@@ -503,7 +503,7 @@ doge mesh forward remove  remote-echo
 
 **agent 可控**：mesh 会话（`doge --mesh`）里 agent 还多一个 `mesh_forward` 工具（`action=list|add|remove|enable|disable`，参数同 CLI），可以在任务执行中自行增删/启停转发，无需切终端。
 
-**远端直接调用（`remote_tool`）**：本机 agent 还可以用 `remote_tool(peer, tool, args)` **直接调用对端节点的节点级工具**（`mesh_forward` / `mesh_peers` / `remote_agent_status`）——一次点对点消息往返即返回，不经远端 agent 派任务、远端不跑 LLM。典型用法：精确操作远端节点做 forward/listen 绑定（如"在 B 上 expose 它本地的 8090"→ `remote_tool(peer=B, tool=mesh_forward, args={action:add, mode:expose, ...})`），远端视角看网格、查远端在途任务同理。直接调用**默认开放**（`allowRemoteTools` 缺省即开——token 即准入边界；显式写 `false` 可关，`trustedPeers` 可收窄到指定节点），profile 带 `remoteTools` 标记（`mesh_peers` 可见）；会话级工具（read/bash 等）不走此通道，远端干"要多步思考的活"仍用 `remote_agent`。`mesh daemon` 无会话节点同样可接受直接调用。
+**远端直接调用（`remote_tool`）**：本机 agent 还可以用 `remote_tool(peer, tool, args)` **直接调用对端节点的节点级工具**（`mesh_forward` / `mesh_peers` / `remote_agent_status`）——一次点对点消息往返即返回，不经远端 agent 派任务、远端不跑 LLM。典型用法：精确操作远端节点做 forward/listen 绑定（如"在 B 上 expose 它本地的 8090"→ `remote_tool(peer=B, tool=mesh_forward, args={action:add, mode:expose, ...})`），远端视角看网格、查远端在途任务同理。直接调用**默认关闭**（`allowRemoteTools` 显式写 `true` 才开放——直接调用能触碰节点配置，fail-closed；`trustedPeers` 可收窄到指定节点），profile 带 `remoteTools` 标记（`mesh_peers` 可见）；会话级工具（read/bash 等）不走此通道，远端干"要多步思考的活"仍用 `remote_agent`。`mesh daemon` 无会话节点同样可接受直接调用。
 
 **peer 别名**：`remote_agent` / `remote_tool` / `mesh_forward` 的 `peer` 参数都可以用**节点名**（mesh.json 的 `name`，`mesh_peers` 输出里的 `name=`）代替完整 peer ID；名字在已连节点中必须唯一——重名会立即报错并列出候选 peer ID，未知名报"节点不存在"，两种情况 agent 都会被引导改用精确 peer ID。`mesh_forward` 的 listen 规则落盘时会把名字解析成真实 peer ID。
 
@@ -546,7 +546,8 @@ doge mesh forward remove  remote-echo
   "name": "laptop-a",
   "roles": ["general", "researcher"],
   "allowRemoteTasks": false,
-  "allowRemoteTools": true,
+  "allowRemoteTools": false,
+  "allowRemoteForwards": false,
   "allowRemoteFiles": false,
   "fileMaxBytes": 268435456,
   "privateNetwork": false,
@@ -561,7 +562,7 @@ doge mesh forward remove  remote-echo
 }
 ```
 
-关键字段：`forwards` 为转发规则（可热重载、可热启停）；`allowRemoteTools` 允许 peer 用 `remote_tool` 直接调用本机节点级工具（mesh_forward/mesh_peers/remote_agent_status，不经远端 agent，**默认开**，`mesh new` 显式写入；写 `false` 关闭）；`allowRemoteFiles` 允许 trusted peer 经 `/doge/file/0.1` 收发文件（**默认关**，收到只进上传暂存区，配合 `fileMaxBytes` 单文件上限，默认 256 MiB）；`relay` 让本节点作为中继（circuit v2 hop，供 NAT 后节点互通，种子节点开启）；`privateNetwork` 为私有/VPN 传输层 PSK 模式（网络内所有节点须同模式）；`bootstrapPeers` 非空时用自建种子、为空时用公共 DHT（token 内嵌的种子地址也会生效）；`listenPort` 为本节点固定监听端口（`0`=每次随机，种子节点应设为固定值）；`cwds` 声明本机可达项目目录（供后续远端任务用，P3+）。节点身份保存在**独立文件 `mesh-key`**（`mesh.json` 同目录，0600），与 `mesh.json` 分开、不随其复制。`trustedPeers` / `remoteTaskLevel` / `maxConcurrentTasks` 等按需配置（`trustedPeers` 同时约束远端任务、直接工具调用与文件传输）。
+关键字段：`forwards` 为转发规则（可热重载、可热启停）；`allowRemoteTools` 允许 peer 用 `remote_tool` 直接调用本机节点级工具（mesh_peers/remote_agent_status 与 mesh_forward 只读操作，不经远端 agent，**默认关**，`mesh new` 显式写入；写 `true` 开启）；`allowRemoteForwards` 进一步放开 mesh_forward 写操作（add/remove/enable/disable/reload，**默认关**）；`allowRemoteFiles` 允许 trusted peer 经 `/doge/file/0.1` 收发文件（**默认关**，收到只进上传暂存区，配合 `fileMaxBytes` 单文件上限，默认 256 MiB）；`relay` 让本节点作为中继（circuit v2 hop，供 NAT 后节点互通，种子节点开启）；`privateNetwork` 为私有/VPN 传输层 PSK 模式（网络内所有节点须同模式）；`bootstrapPeers` 非空时用自建种子、为空时用公共 DHT（token 内嵌的种子地址也会生效）；`listenPort` 为本节点固定监听端口（`0`=每次随机，种子节点应设为固定值）；`cwds` 声明本机可达项目目录（供后续远端任务用，P3+）。节点身份保存在**独立文件 `mesh-key`**（`mesh.json` 同目录，0600），与 `mesh.json` 分开、不随其复制。`trustedPeers` / `remoteTaskLevel` / `maxConcurrentTasks` 等按需配置（`trustedPeers` 同时约束远端任务、直接工具调用与文件传输）。
 
 ### CLI 参考
 

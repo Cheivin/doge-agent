@@ -124,7 +124,7 @@ mesh 会话（`doge --mesh`）的 agent 侧工具：`mesh_forward`（管理本�
 参数可随任务把暂存区文件递给远端）、`remote_agent_status`（查在途远端任务）、
 `remote_tool`（**直接调用远端节点级
 工具**——精确操作远端 forward/listen 绑定、查远端网格视图，不经远端 agent、
-远端不跑 LLM；直接调用默认开放，远端写 `allowRemoteTools: false` 可关闭）、
+远端不跑 LLM；直接调用**默认关闭**，远端显式写 `allowRemoteTools: true` 才开放，其 mesh_forward 写操作还需 `allowRemoteForwards: true`）、
 `mesh_file`（跨节点文件传输：`stage` 本地文件进暂存区、`send` 推给对端、
 `pull` 拉回、`list` 看对端可分享文件；对端须开 `allowRemoteFiles`，收到的文件
 只进暂存区，由 agent 用 read 决定用途）。各工具的 `peer`
@@ -303,6 +303,14 @@ JSON 数组，每个元素一个模型：
 
 内置模型目录：`doge --list-models`。
 
+Web 控制台/桌面端编辑模型后立即热生效：保存即重写 models.json 并重载所有
+活跃会话（含 TUI 与其他窗口），新 turn 用新配置，无需新建会话或重启；改名
+编辑替换原条目（0.11 及更早是纯追加，遗留的同 key 重复条目在下次保存时
+自动去重治愈），settings 默认指向随改名/删除自动跟随（全局与项目两层都查）。
+设置界面未覆盖的扩展字段（`headers`/`sessionAffinity`/`impersonate`/
+`thinkingLevelMap`/`cost`）编辑后保留不丢，要改这些字段直接编辑 models.json
+后点「重载」。
+
 ### 4.3 settings.json —— 设置（全局 + 项目合并）
 <!-- module: settings-json | 全局设置字段表：web、日志、流超时、上下文策略等 -->
 
@@ -353,7 +361,7 @@ JSON 数组，每个元素一个模型：
 | `web.noTui` | 仅 Web 模式（`--no-tui` 覆盖） |
 | `web.corsOrigins` | 允许跨域的 WebUI 来源（`--web-cors` 覆盖，可重复） |
 | `uploads.*` | 文件上传限制（零值取默认）：单请求/单文件 100MiB、暂存区配额 512MiB、保留 7 天（`~/.doge/agent/uploads`，后台周期清理）、图片直接注入对话上限 5MiB、文本全文注入上限 64KiB |
-| `automation.*` | 定时任务调度（零值取默认，仅全局生效）：并发 1、单次超时 60 分钟、台账保留 30 天、上限 50 条；`enabled=false` 可整体停用（见「4.9 定时任务」） |
+| `automation.*` | 定时任务调度（零值取默认，仅全局生效）：并发 1、单次超时 60 分钟、台账保留 30 天、上限 50 条；`enabled` 未写（或只写其他字段）= 启用，显式 `false` 才整体停用（见「4.9 定时任务」） |
 
 Web 参数优先级：**CLI 参数 > settings `web` 节 > 内置默认**。
 
@@ -497,7 +505,8 @@ curl/wget 归 network 级；LLM 审批的待审批命令用 `<command>` 围栏�
   "roles": ["general", "researcher"],
   "allowRemoteTasks": false,
   "remoteTaskLevel": "readonly",
-  "allowRemoteTools": true,
+  "allowRemoteTools": false,
+  "allowRemoteForwards": false,
   "allowRemoteFiles": false,
   "fileMaxBytes": 268435456,
   "privateNetwork": false,
@@ -517,10 +526,18 @@ curl/wget 归 network 级；LLM 审批的待审批命令用 `<command>` 围栏�
 - `name` / `roles`：节点名 / 能力角色（广播给对端；`name` 可作为远端调用的
   peer 别名，重名会被拒绝并要求用 peer ID）
 - `allowRemoteTasks`：是否接受远端 agent 任务（`remote_agent`）
-- `remoteTaskLevel`：远端任务权限分级 `readonly`（默认）/ `write` / `full`
+- `remoteTaskLevel`：远端任务权限分级 `readonly`（默认）/ `write` / `full`；
+  write 级不挂 `code` 工具（以用户全权限跑脚本，等同 full），远端/定时任务
+  的文件访问一律限定在会话 cwd 与上传暂存区（读 `~/.doge/agent` 下的密钥、
+  配置一律拒绝）
 - `allowRemoteTools`：是否接受 `remote_tool` 直接调用本机节点级工具
-  （mesh_forward/mesh_peers/remote_agent_status，不经远端 agent；**默认开**，
-  显式写 `false` 关闭，`trustedPeers` 可收窄）
+  （mesh_peers/remote_agent_status 与 mesh_forward 只读操作，不经远端
+  agent；**默认关**——直接调用能触碰节点配置，须显式写 `true` 开启，
+  `trustedPeers` 可收窄）
+- `allowRemoteForwards`：允许直接调用 `mesh_forward` 的写操作（add/remove/
+  enable/disable/reload——可暴露本机服务、绑定监听、改转发规则；**默认关**；
+  前提是 `allowRemoteTools` 已开；远端 agent 任务内使用 mesh_forward 由
+  `remoteTaskLevel: full` 控制，不受此开关影响）
 - `allowRemoteFiles`：是否接受 trusted peer 经 `/doge/file/0.1` 收发文件
   （`mesh_file` 工具与 remote_agent 的 files 参数；**默认关**）。收到的文件
   只进上传暂存区 `~/.doge/agent/uploads`，绝不直达文件系统；`fileMaxBytes`
@@ -580,7 +597,7 @@ mesh.json 复制到别的机器**。`trustedPeers`（同时约束远端任务、
 
 | action | 参数 | 说明 |
 |---|---|---|
-| `create` | `title`/`prompt` + `delayMinutes` 或 `cron` 或 `intervalUnit`+`interval`（三选一） | 建任务；`cwd`/`model`/`level`/`maxRuns` 可选 |
+| `create` | `title`/`prompt` + `delayMinutes` 或 `cron` 或 `intervalUnit`+`interval`（三选一） | 建任务；`cwd`/`model`/`level`/`maxRuns` 可选。工具创建的 `level` 默认 **readonly**，`full` 与会话目录外的 `cwd` 为用户保留（须经设置界面/CLI 创建） |
 | `list` / `get` | `id`（get） | 概要表 / 详情 + 最近 3 次 |
 | `update` | `id` + 可变字段 | 调度变更即重锚重算下次触发 |
 | `delete` / `enable` / `disable` | `id` | 删除 / 暂停 / 恢复（仅 paused 可恢复） |
