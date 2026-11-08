@@ -7,23 +7,16 @@ import (
 
 	"doge/internal/ai"
 	"doge/internal/coding"
-	"doge/internal/console"
 	"doge/internal/coding/permissions"
+	"doge/internal/console"
 	"doge/internal/web"
 	"doge/pkg/logx"
 )
-
 
 type (
 	// ConfigService 配置与诊断（对应 /api/config*、/api/reload、/api/logs）
 	ConfigService struct {
 		d Deps
-	}
-
-	// authEntry auth.json 单条记录（{"type":"api_key","key":"..."}）
-	authEntry struct {
-		Type string `json:"type"`
-		Key  string `json:"key"`
 	}
 )
 
@@ -84,7 +77,7 @@ func (s *ConfigService) SettingsGet() (map[string]any, error) {
 // SettingsPut 整体替换全局 settings.json（GET → 编辑 → PUT），启动时生效。
 // 项目层持有旧默认时同步清掉（project wins 会遮蔽全局新值），默认决定权归全局。
 func (s *ConfigService) SettingsPut(cfg coding.Settings) error {
-	if e := console.SettingsPut(cfg, s.consoleDeps()); e != nil {
+	if e := console.SettingsPut(cfg, s.d.consoleDeps()); e != nil {
 		return consoleErr(e)
 	}
 	return nil
@@ -111,7 +104,7 @@ func (s *ConfigService) Providers() (map[string]any, error) {
 
 // AuthSet 写入 provider API 密钥（空 key 等价删除）并热重载
 func (s *ConfigService) AuthSet(provider, key string) map[string]any {
-	resp, e := console.AuthSet(provider, key, s.consoleDeps())
+	resp, e := console.AuthSet(provider, key, s.d.consoleDeps())
 	if e != nil {
 		return map[string]any{"ok": false, "reloaded": false, "error": e.Message}
 	}
@@ -120,7 +113,7 @@ func (s *ConfigService) AuthSet(provider, key string) map[string]any {
 
 // AuthDelete 删除 provider 密钥并热重载
 func (s *ConfigService) AuthDelete(provider string) map[string]any {
-	resp, e := console.AuthDelete(provider, s.consoleDeps())
+	resp, e := console.AuthDelete(provider, s.d.consoleDeps())
 	if e != nil {
 		return map[string]any{"ok": false, "reloaded": false, "error": e.Message}
 	}
@@ -140,7 +133,7 @@ func (s *ConfigService) ModelsGet() ([]*ai.Model, error) {
 // previous 非空（"provider/id"）表示改名编辑：替换旧条目而非追加重复，
 // 当前会话落在旧 key 上时同步切到新 spec。
 func (s *ConfigService) ModelsUpsert(m ai.Model, previous string) map[string]any {
-	resp, e := console.ModelUpsert(m, previous, s.consoleDeps())
+	resp, e := console.ModelUpsert(m, previous, s.d.consoleDeps())
 	if e != nil {
 		return map[string]any{"ok": false, "reloaded": false, "error": e.Message}
 	}
@@ -150,7 +143,7 @@ func (s *ConfigService) ModelsUpsert(m ai.Model, previous string) map[string]any
 // ModelsDelete 删除自定义模型（内置模型拒绝）并热重载；删除的是当前活跃
 // 模型时回退切到第一个可用模型
 func (s *ConfigService) ModelsDelete(provider, id string) map[string]any {
-	resp, e := console.ModelDelete(provider, id, s.consoleDeps())
+	resp, e := console.ModelDelete(provider, id, s.d.consoleDeps())
 	if e != nil {
 		return map[string]any{"ok": false, "reloaded": false, "error": e.Message}
 	}
@@ -158,21 +151,21 @@ func (s *ConfigService) ModelsDelete(provider, id string) map[string]any {
 }
 
 // consoleDeps 组装配置操作的会话上下文（cwd/热重载扇出/模型回退）
-func (s *ConfigService) consoleDeps() console.ConfigDeps {
+func (d Deps) consoleDeps() console.ConfigDeps {
 	return console.ConfigDeps{
-		Cwd:          s.d.Backend.Status().Cwd,
-		ReloadAll:    func() error { return reloadAllSessions(s.d) },
-		ModelCurrent: func() string { return s.d.Backend.Status().Model },
+		Cwd:          d.Backend.Status().Cwd,
+		ReloadAll:    func() error { return reloadAllSessions(d) },
+		ModelCurrent: func() string { return d.Backend.Status().Model },
 		ModelFallback: func() []string {
 			var specs []string
-			for _, m := range s.d.Backend.ListModels() {
+			for _, m := range d.Backend.ListModels() {
 				if m.Available {
 					specs = append(specs, m.Spec)
 				}
 			}
 			return specs
 		},
-		ModelSwitch: func(spec string) error { return s.d.Backend.SwitchModel(spec) },
+		ModelSwitch: func(spec string) error { return d.Backend.SwitchModel(spec) },
 	}
 }
 
@@ -230,36 +223,6 @@ func reloadAllSessions(d Deps) error {
 	return err
 }
 
-// readAuthKeys 解析 auth.json 为 provider → key（文件缺失视为空）
-func readAuthKeys() (map[string]string, error) {
-	data, err := os.ReadFile(coding.AuthFile())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]string{}, nil
-		}
-		return nil, err
-	}
-	raw := map[string]authEntry{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, err
-	}
-	keys := make(map[string]string, len(raw))
-	for p, e := range raw {
-		if e.Key != "" {
-			keys[p] = e.Key
-		}
-	}
-	return keys, nil
-}
-
-// maskKey 只留末 4 位，标识"设置了哪把钥匙"而不外泄密钥
-func maskKey(key string) string {
-	if len(key) <= 4 {
-		return "****"
-	}
-	return "…" + key[len(key)-4:]
-}
-
 // PermissionsGet 读权限策略（permissions.json；不存在返回空策略）
 func (s *ConfigService) PermissionsGet() (map[string]any, error) {
 	path := permissionsPath()
@@ -282,12 +245,12 @@ func (s *ConfigService) PermissionsPut(policy permissions.Policy) map[string]any
 	if err != nil {
 		return map[string]any{"ok": false, "reloaded": false, "error": err.Error()}
 	}
-	if _, err := validatePermissionsData(data); err != nil {
-		return map[string]any{"ok": false, "reloaded": false, "error": err.Error()}
+	if _, e := console.ValidatePermissionsData(data); e != nil {
+		return map[string]any{"ok": false, "reloaded": false, "error": e.Message}
 	}
 	target := permissionsPath()
-	backupFile(target)
-	if err := writeFileAtomic(target, data, 0o600); err != nil {
+	console.BackupFile(target)
+	if err := console.WriteFileAtomic(target, data, 0o600); err != nil {
 		return map[string]any{"ok": false, "reloaded": false, "error": err.Error()}
 	}
 	logx.Infof("[desktop] permissions.json rewritten via service")

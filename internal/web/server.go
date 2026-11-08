@@ -21,6 +21,7 @@ import (
 	"doge/internal/ai"
 	"doge/internal/coding"
 	"doge/internal/coding/uploads"
+	"doge/internal/console"
 	"doge/internal/mcp"
 	"doge/internal/mesh"
 )
@@ -30,15 +31,15 @@ var Version = "dev"
 
 // Options 配置 Web Server
 type Options struct {
-	Backend     Backend        // 后端实现
-	Token       string         // 访问令牌，空则自动生成
-	Address     string         // 监听地址，如 "127.0.0.1:8080"
-	Mesh        MeshView       // mesh 网络视图，nil 则隐藏面板
-	Mcp         McpView        // MCP 管理器视图
-	Automations AutomationView // 定时任务管理面，nil 则 /api/automations 503
-	CorsOrigins []string       // CORS 允许的源，"*" 允许所有
-	Shutdown    func()         // 关闭回调，nil 则 503
-	Uploads     *uploads.Store // 上传暂存区，nil 则上传接口 503
+	Backend     Backend                  // 后端实现
+	Token       string                   // 访问令牌，空则自动生成
+	Address     string                   // 监听地址，如 "127.0.0.1:8080"
+	Mesh        MeshView                 // mesh 网络视图，nil 则隐藏面板
+	Mcp         McpView                  // MCP 管理器视图
+	Automations console.AutomationSource // 定时任务管理面，nil 则 /api/automations 503
+	CorsOrigins []string                 // CORS 允许的源，"*" 允许所有
+	Shutdown    func()                   // 关闭回调，nil 则 503
+	Uploads     *uploads.Store           // 上传暂存区，nil 则上传接口 503
 }
 
 // MeshView exposes the mesh network (connected nodes + remote-task status) to
@@ -103,7 +104,7 @@ type Server struct {
 	mcpView McpView
 
 	// automations backs the automations endpoints (nil = /api/automations 503).
-	automations AutomationView
+	automations console.AutomationSource
 
 	// shutdown backs POST /api/shutdown (nil = endpoint answers 503).
 	shutdown func()
@@ -112,10 +113,6 @@ type Server struct {
 	// 周期清理不在这里——由 main 的 uploadStore.StartSweep 统一挂载，
 	// TUI/mesh-only 模式同样生效
 	uploads *uploads.Store
-
-	// applyMu 串行化 place/apply 的写盘段：并发 confirm 会互相覆盖 .bak
-	// 备份并竞争写同一目标文件
-	applyMu sync.Mutex
 
 	// configMu 串行化全部配置文件的读-改-写段（settings/auth/models）：并发
 	// PUT/POST 都是 Load→改→Save，无锁并发丢更新（后写覆盖先写）

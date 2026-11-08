@@ -2,10 +2,9 @@ package services
 
 import (
 	"encoding/json"
-	"errors"
 	"strings"
 
-	"doge/internal/mcp"
+	"doge/internal/console"
 	"doge/internal/web"
 )
 
@@ -137,9 +136,9 @@ func (s *McpService) UpsertServers(body json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	servers, err := parseMcpServersBody(body)
-	if err != nil {
-		return errInvalid(err.Error())
+	servers, e := console.ParseMcpServersPayload(body)
+	if e != nil {
+		return errInvalid(e.Message)
 	}
 	if err := v.UpsertServers(servers); err != nil {
 		return errInvalid(err.Error())
@@ -158,31 +157,4 @@ func (s *McpService) Reload() error {
 	}
 	s.redistribute()
 	return nil
-}
-
-// parseMcpServersBody 解析社区 mcpServers 粘贴格式（apply 复用）：
-//
-//	{"playwright": {"command":"npx","args":[...]}}               （内层 map）
-//	{"mcpServers": {"playwright": {"command":"npx","args":[...]}}} （完整 .mcp.json）
-func parseMcpServersBody(body []byte) (map[string]*mcp.Server, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil || len(raw) == 0 {
-		return nil, errors.New(`invalid request body: want an mcpServers object like {"playwright":{"command":"npx","args":[]}}`)
-	}
-	if _, ok := raw["mcpServers"]; ok && len(raw) == 1 {
-		var servers map[string]*mcp.Server
-		if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil || len(servers) == 0 {
-			return nil, errors.New(`mcpServers 值必须是一个对象，如 {"playwright":{"command":"npx"}}`)
-		}
-		return servers, nil
-	}
-	servers := make(map[string]*mcp.Server, len(raw))
-	for k, v := range raw {
-		var srv mcp.Server
-		if err := json.Unmarshal(v, &srv); err != nil {
-			return nil, errors.New("server " + k + ": " + err.Error())
-		}
-		servers[k] = &srv
-	}
-	return servers, nil
 }

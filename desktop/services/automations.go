@@ -2,9 +2,9 @@ package services
 
 import (
 	"encoding/json"
-	"errors"
 
 	"doge/internal/coding/automation"
+	"doge/internal/console"
 )
 
 type (
@@ -28,11 +28,11 @@ func (s *AutomationsService) List() (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	cards, err := v.Cards()
-	if err != nil {
-		return nil, errInternal(err)
+	result, e := console.AutomationList(v)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	return map[string]any{"automations": cards}, nil
+	return result, nil
 }
 
 // Create 建任务（cwd 缺省取当前会话目录，来源会话记当前会话）
@@ -45,11 +45,11 @@ func (s *AutomationsService) Create(draft automation.Automation) (map[string]any
 		draft.Cwd = s.d.Backend.Status().Cwd
 	}
 	draft.SourceSessionID = s.d.Backend.Status().SessionID
-	created, err := v.Create(&draft)
-	if err != nil {
-		return nil, errInvalid(err.Error())
+	result, e := console.AutomationCreate(v, &draft)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	return map[string]any{"automation": created}, nil
+	return result, nil
 }
 
 // Get 单条详情 + 最近 run（runs 控制条数，0 取默认 5）
@@ -58,18 +58,11 @@ func (s *AutomationsService) Get(id string, runs int) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	a, err := v.Get(id)
-	if err != nil {
-		return nil, errNotFound(err.Error())
+	result, e := console.AutomationGet(v, id, runs)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	if runs <= 0 {
-		runs = 5
-	}
-	history, _ := v.History(id, runs)
-	if history == nil {
-		history = []*automation.Run{}
-	}
-	return map[string]any{"automation": a, "runs": history}, nil
+	return result, nil
 }
 
 // Update 部分更新：fields 为 JSON 键值（title/prompt/cwd/model/level/maxRuns/
@@ -83,42 +76,15 @@ func (s *AutomationsService) Update(id string, fields map[string]any) (map[strin
 	if err != nil {
 		return nil, errInvalid(err.Error())
 	}
-	p := &automation.Patch{}
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, errInvalid(err.Error())
 	}
-	applyStr := func(key string, dst **string) {
-		if val, ok := body[key]; ok {
-			var s2 string
-			if json.Unmarshal(val, &s2) == nil {
-				*dst = &s2
-			}
-		}
+	result, e := console.AutomationPatch(v, id, body)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	applyStr("title", &p.Title)
-	applyStr("prompt", &p.Prompt)
-	applyStr("cwd", &p.Cwd)
-	applyStr("model", &p.Model)
-	applyStr("level", &p.Level)
-	if val, ok := body["maxRuns"]; ok {
-		var n int
-		if json.Unmarshal(val, &n) == nil {
-			p.MaxRuns = &n
-		}
-	}
-	if val, ok := body["schedule"]; ok {
-		var sc automation.Schedule
-		if err := json.Unmarshal(val, &sc); err != nil {
-			return nil, errInvalid("invalid schedule: " + err.Error())
-		}
-		p.Schedule = &sc
-	}
-	updated, err := v.Update(id, p)
-	if err != nil {
-		return nil, errInvalid(err.Error())
-	}
-	return map[string]any{"automation": updated}, nil
+	return result, nil
 }
 
 // Delete 删除任务
@@ -127,8 +93,8 @@ func (s *AutomationsService) Delete(id string) error {
 	if err != nil {
 		return err
 	}
-	if err := v.Delete(id); err != nil {
-		return errNotFound(err.Error())
+	if e := console.AutomationDelete(v, id); e != nil {
+		return consoleErr(e)
 	}
 	return nil
 }
@@ -139,11 +105,11 @@ func (s *AutomationsService) SetEnabled(id string, enabled bool) (map[string]any
 	if err != nil {
 		return nil, err
 	}
-	a, err := v.SetEnabled(id, enabled)
-	if err != nil {
-		return nil, errInvalid(err.Error())
+	result, e := console.AutomationSetEnabled(v, id, enabled)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	return map[string]any{"automation": a}, nil
+	return result, nil
 }
 
 // Run 手动立即触发（异步，不占调度节奏）
@@ -152,11 +118,11 @@ func (s *AutomationsService) Run(id string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	runID, err := v.Run(id)
-	if err != nil {
-		return nil, errInvalid(err.Error())
+	result, e := console.AutomationRun(v, id)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	return map[string]any{"ok": true, "runId": runID}, nil
+	return result, nil
 }
 
 // Runs 任务台账（limit 0 取默认 10）；调度器不可用视为空台账（同 Web 口径）
@@ -165,15 +131,9 @@ func (s *AutomationsService) Runs(id string, limit int) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 {
-		limit = 10
+	result, e := console.AutomationRuns(v, id, limit)
+	if e != nil {
+		return nil, consoleErr(e)
 	}
-	runs, err := v.History(id, limit)
-	if err != nil && !errors.Is(err, automation.ErrUnavailable) {
-		return nil, errNotFound(err.Error())
-	}
-	if runs == nil {
-		runs = []*automation.Run{}
-	}
-	return map[string]any{"runs": runs}, nil
+	return result, nil
 }

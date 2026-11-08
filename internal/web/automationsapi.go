@@ -2,29 +2,12 @@ package web
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
 
 	"doge/internal/coding/automation"
+	"doge/internal/console"
 )
-
-// AutomationView exposes the automation manager to the console API. It is
-// satisfied structurally by *automation.API; nil (test stubs) answers 503.
-type AutomationView interface {
-	Cards() ([]*automation.AutomationCard, error)
-	Get(id string) (*automation.Automation, error)
-	Create(draft *automation.Automation) (*automation.Automation, error)
-	Update(id string, p *automation.Patch) (*automation.Automation, error)
-	Delete(id string) error
-	SetEnabled(id string, enabled bool) (*automation.Automation, error)
-	Run(id string) (string, error)
-	Runs() ([]*automation.Run, error)
-	History(id string, limit int) ([]*automation.Run, error)
-}
-
-// defaultRunsLimit 单任务历史默认条数
-const defaultRunsLimit = 10
 
 // handleAutomationsList 面板数据：全部任务卡片（含最近一次 run）。
 func (s *Server) handleAutomationsList(w http.ResponseWriter, r *http.Request) {
@@ -32,12 +15,12 @@ func (s *Server) handleAutomationsList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "automations not available")
 		return
 	}
-	cards, err := s.automations.Cards()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	result, e := console.AutomationList(s.automations)
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"automations": cards})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleAutomationsCreate 建任务：body 即 Automation 文档（title/prompt/
@@ -57,12 +40,12 @@ func (s *Server) handleAutomationsCreate(w http.ResponseWriter, r *http.Request)
 		draft.Cwd = s.defaultBackend.Status().Cwd
 	}
 	draft.SourceSessionID = s.defaultBackend.Status().SessionID
-	created, err := s.automations.Create(&draft)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	result, e := console.AutomationCreate(s.automations, &draft)
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"automation": created})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleAutomationsGet 单条详情 + 最近 run（?runs=N 控制条数，默认 5）。
@@ -71,22 +54,18 @@ func (s *Server) handleAutomationsGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "automations not available")
 		return
 	}
-	a, err := s.automations.Get(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	limit := 5
+	limit := 0
 	if v := r.URL.Query().Get("runs"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}
-	runs, _ := s.automations.History(a.ID, limit)
-	if runs == nil {
-		runs = []*automation.Run{}
+	result, e := console.AutomationGet(s.automations, r.PathValue("id"), limit)
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"automation": a, "runs": runs})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleAutomationsPatch 部分更新：body 里出现的字段才改（title/prompt/cwd/
@@ -101,40 +80,12 @@ func (s *Server) handleAutomationsPatch(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	p := &automation.Patch{}
-	applyStr := func(key string, dst **string) {
-		if raw, ok := body[key]; ok {
-			var v string
-			if json.Unmarshal(raw, &v) == nil {
-				*dst = &v
-			}
-		}
-	}
-	applyStr("title", &p.Title)
-	applyStr("prompt", &p.Prompt)
-	applyStr("cwd", &p.Cwd)
-	applyStr("model", &p.Model)
-	applyStr("level", &p.Level)
-	if raw, ok := body["maxRuns"]; ok {
-		var v int
-		if json.Unmarshal(raw, &v) == nil {
-			p.MaxRuns = &v
-		}
-	}
-	if raw, ok := body["schedule"]; ok {
-		var sc automation.Schedule
-		if err := json.Unmarshal(raw, &sc); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid schedule: "+err.Error())
-			return
-		}
-		p.Schedule = &sc
-	}
-	updated, err := s.automations.Update(r.PathValue("id"), p)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	result, e := console.AutomationPatch(s.automations, r.PathValue("id"), body)
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"automation": updated})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleAutomationsDelete 删除任务。
@@ -143,8 +94,8 @@ func (s *Server) handleAutomationsDelete(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusServiceUnavailable, "automations not available")
 		return
 	}
-	if err := s.automations.Delete(r.PathValue("id")); err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+	if e := console.AutomationDelete(s.automations, r.PathValue("id")); e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -157,12 +108,12 @@ func (s *Server) handleAutomationsSetEnabled(enabled bool) http.HandlerFunc {
 			writeError(w, http.StatusServiceUnavailable, "automations not available")
 			return
 		}
-		a, err := s.automations.SetEnabled(r.PathValue("id"), enabled)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+		result, e := console.AutomationSetEnabled(s.automations, r.PathValue("id"), enabled)
+		if e != nil {
+			writeError(w, e.Kind.HTTPStatus(), e.Message)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"automation": a})
+		writeJSON(w, http.StatusOK, result)
 	}
 }
 
@@ -172,12 +123,12 @@ func (s *Server) handleAutomationsRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "automations not available")
 		return
 	}
-	runID, err := s.automations.Run(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	result, e := console.AutomationRun(s.automations, r.PathValue("id"))
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runId": runID})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleAutomationsRuns 任务台账（?limit=N，默认 10）。
@@ -186,19 +137,16 @@ func (s *Server) handleAutomationsRuns(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "automations not available")
 		return
 	}
-	limit := defaultRunsLimit
+	limit := 0
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}
-	runs, err := s.automations.History(r.PathValue("id"), limit)
-	if err != nil && !errors.Is(err, automation.ErrUnavailable) {
-		writeError(w, http.StatusNotFound, err.Error())
+	result, e := console.AutomationRuns(s.automations, r.PathValue("id"), limit)
+	if e != nil {
+		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
 	}
-	if runs == nil {
-		runs = []*automation.Run{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+	writeJSON(w, http.StatusOK, result)
 }

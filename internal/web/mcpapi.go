@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"doge/internal/mcp"
+	"doge/internal/console"
 	"doge/pkg/logx"
 )
 
@@ -128,9 +128,9 @@ func (s *Server) handleMcpServersUpsert(w http.ResponseWriter, r *http.Request) 
 	}
 	logx.Debugf("[web] mcp config import body(%d): %s", len(body), preview)
 
-	servers, err := parseMcpServersBody(body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	servers, e := console.ParseMcpServersPayload(body)
+	if e != nil {
+		writeError(w, http.StatusBadRequest, e.Message)
 		return
 	}
 	if err := s.mcpView.UpsertServers(servers); err != nil {
@@ -138,33 +138,6 @@ func (s *Server) handleMcpServersUpsert(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// parseMcpServersBody 解析社区 mcpServers 粘贴格式（apply 接口复用）：
-//
-//	{"playwright": {"command":"npx","args":[...]}}               （内层 map）
-//	{"mcpServers": {"playwright": {"command":"npx","args":[...]}}} （完整 .mcp.json 内容）
-func parseMcpServersBody(body []byte) (map[string]*mcp.Server, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil || len(raw) == 0 {
-		return nil, errors.New(`invalid request body: want an mcpServers object like {"playwright":{"command":"npx","args":[]}}`)
-	}
-	if _, ok := raw["mcpServers"]; ok && len(raw) == 1 {
-		var servers map[string]*mcp.Server
-		if err := json.Unmarshal(raw["mcpServers"], &servers); err != nil || len(servers) == 0 {
-			return nil, errors.New(`mcpServers 值必须是一个对象，如 {"playwright":{"command":"npx"}}`)
-		}
-		return servers, nil
-	}
-	servers := make(map[string]*mcp.Server, len(raw))
-	for k, v := range raw {
-		var srv mcp.Server
-		if err := json.Unmarshal(v, &srv); err != nil {
-			return nil, errors.New("server " + k + ": " + err.Error())
-		}
-		servers[k] = &srv
-	}
-	return servers, nil
 }
 
 // handleMcpServersRemove deletes a server definition from the project

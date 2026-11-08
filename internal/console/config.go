@@ -87,7 +87,7 @@ func SettingsPut(cfg coding.Settings, d ConfigDeps) *Error {
 	}
 	configMu.Lock()
 	defer configMu.Unlock()
-	if err := writeFileAtomic(coding.SettingsFile(), append(data, '\n'), 0o600); err != nil {
+	if err := WriteFileAtomic(coding.SettingsFile(), append(data, '\n'), 0o600); err != nil {
 		return Wrap(err)
 	}
 	logx.Infof("[console] settings.json rewritten")
@@ -412,9 +412,9 @@ func syncSettingsDefault(cwd, oldSpec, newSpec string) {
 	}
 }
 
-// writeFileAtomic 原子落盘：写同目录临时文件后 rename，磁盘满/中途失败
+// WriteFileAtomic 原子落盘：写同目录临时文件后 rename，磁盘满/中途失败
 // 不留截断的目标文件
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".doge-apply-*")
 	if err != nil {
 		return err

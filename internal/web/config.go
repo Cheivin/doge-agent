@@ -9,7 +9,6 @@ import (
 	"doge/internal/ai"
 	"doge/internal/coding"
 	"doge/internal/console"
-	"doge/pkg/logx"
 )
 
 const (
@@ -108,7 +107,6 @@ func (s *Server) mcpOverview() map[string]any {
 	}
 }
 
-
 // handleSettingsGet 生效设置（全局 + 项目合并）与两个文件路径
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	result, e := console.SettingsGet(s.defaultBackend.Status().Cwd)
@@ -134,33 +132,6 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restartRequired": true})
-}
-
-// clearProjectDefaultIfStale 项目 settings 持有默认模型且与请求体的默认不同
-// 时，清掉项目层旧默认：合并时 project wins，只写全局不生效——UI 改默认
-// 显示已保存但实际仍是旧值即来源于此。清场后默认模型的决定权归全局。
-func (s *Server) clearProjectDefaultIfStale(provider, model string) {
-	path := coding.ProjectSettingsFile(s.defaultBackend.Status().Cwd)
-	st, err := coding.ReadSettingsFile(path)
-	if err != nil || st.DefaultProvider == "" {
-		return
-	}
-	if st.DefaultProvider == provider && st.DefaultModel == model {
-		return
-	}
-	st.DefaultProvider = ""
-	st.DefaultModel = ""
-	if err := coding.SaveSettings(path, st); err != nil {
-		logx.Warnf("[web] clear project default: %v", err)
-		return
-	}
-	logx.Infof("[web] project-level stale default cleared: %s", path)
-}
-
-// authEntry mirrors one auth.json record ({"type":"api_key","key":"..."}).
-type authEntry struct {
-	Type string `json:"type"`
-	Key  string `json:"key"`
 }
 
 // handleAuthGet 各 provider 的密钥配置状态（打码，不回传明文）
@@ -201,7 +172,6 @@ func (s *Server) handleAuthDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
-
 
 // reloadAfterConfigWrite 配置写盘后的全局重载：请求窗口会话先走 Backend 接口
 // 重载（兼容测试桩），再补齐 TUI 共享会话与控制表全部活跃会话（各窗口分叉、
@@ -273,19 +243,6 @@ func (s *Server) handleConfigModelsDelete(w http.ResponseWriter, r *http.Request
 	if e != nil {
 		writeError(w, e.Kind.HTTPStatus(), e.Message)
 		return
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-// answerAfterConfigWrite answers a successful config-file write, reporting
-// whether the live reload also took. A failed reload leaves the file written
-// (the response carries the error; POST /api/reload can retry).
-func (s *Server) answerAfterConfigWrite(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]any{"ok": true, "reloaded": true}
-	if err := s.reloadAfterConfigWrite(s.backendFor(r)); err != nil {
-		logx.Warnf("[web] reload after config write: %v", err)
-		resp["reloaded"] = false
-		resp["error"] = err.Error()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
