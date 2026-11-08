@@ -98,7 +98,17 @@ func (r *Runner) Execute(ctx context.Context, a *Automation, trigger string, sch
 
 // execute 带 runID 的执行体（ManualRun 预生成 id，保证返回值与台账行一致）
 func (r *Runner) execute(ctx context.Context, a *Automation, trigger string, scheduledAt int64, runID string) {
-	defer r.release()
+	// 单次释放（本 goroutine 串行，无需锁）：notify 可能在共享会话上同步
+	// 跑一轮 agent（等权限/问题回答时可久阻塞），必须先归还并发槽再通知，
+	// 否则默认并发 1 时 notify 卡住全部定时任务；defer 兜底 panic 路径
+	released := false
+	releaseOnce := func() {
+		if !released {
+			released = true
+			r.release()
+		}
+	}
+	defer releaseOnce()
 	start := r.now()
 	run := &Run{
 		ID:           runID,
@@ -124,6 +134,7 @@ func (r *Runner) execute(ctx context.Context, a *Automation, trigger string, sch
 	r.AppendRun(run)
 	logx.Infof("[automation] 任务完成 %s outcome=%s err=%v", a.ID, outcome, runErr)
 	r.settle(a, trigger, scheduledAt, outcome, runErr, permanent)
+	releaseOnce()
 	r.notify(a, run)
 }
 
@@ -240,8 +251,20 @@ func (r *Runner) settle(a *Automation, trigger string, scheduledAt int64, outcom
 		case OutcomeSucceeded, OutcomeStopped:
 			cur.ScheduledRunCount++
 			cur.Retry = nil
-			next, err := computeNextRun(cur.Schedule, time.Unix(scheduledAt, 0))
-			if err != nil || next.IsZero() {
+			// 长 run 期间 maintain 已把错过的周期记 skipped 并推进 NextRunAt——
+			// 尊重推进值；从原 scheduledAt 重算会把下次触发回拨到已过去/
+			// 已记 skip 的周期（30 分钟 run × 10 分钟间隔：next 从 10:30
+			// 回拨到 10:10，再空转一轮 misfire）
+			var next time.Time
+			if cur.NextRunAt > scheduledAt {
+				next = time.Unix(cur.NextRunAt, 0)
+			} else {
+				n, err := computeNextRun(cur.Schedule, time.Unix(scheduledAt, 0))
+				if err == nil {
+					next = n
+				}
+			}
+			if next.IsZero() {
 				cur.Status = StatusCompleted
 				cur.Enabled = false
 				cur.NextRunAt = 0
@@ -368,8 +391,13 @@ func (r *Runner) AppendRun(run *Run) {
 	}
 }
 
-// appendRunLine 追加一行 JSON（O_APPEND 单次写，小行原子）
+// appendRunLine 追加一行 JSON（O_APPEND 单次写，小行原子）。与 SweepRuns
+// 的读-重写窗口互斥：append 若落在 sweep 读取之后、rename 之前会随旧文件
+// 一起被覆盖丢行；持同一把进程内锁后，append 只可能落在快照前（进 keep）
+// 或 rename 后（写入新文件）
 func appendRunLine(path string, run *Run) error {
+	runsSweepMu.Lock()
+	defer runsSweepMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

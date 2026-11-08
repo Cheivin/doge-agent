@@ -257,7 +257,7 @@ func Assemble(e *Env, opts Options) (*App, error) {
 	autoDeps.Session = sess
 	autoAPI := automation.NewAPI(autoStore, autoDeps.Runner)
 	var automationCancel context.CancelFunc
-	if opts.Scheduler && (autoSettings == nil || autoSettings.Enabled) {
+	if opts.Scheduler && autoSettings.AutomationEnabled() {
 		autoCtx, cancel := context.WithCancel(context.Background())
 		automationCancel = cancel
 		automation.NewScheduler(autoStore, autoDeps.Runner).Start(autoCtx)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -56,9 +57,9 @@ func Tool(d *ToolDeps) *agent.AgentTool {
 				"weekdays":     map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "create/update: week interval only, 0-6 (Sunday=0), empty = every day"},
 				"monthDays":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "create/update: month interval only, 1-31, empty = anchor day"},
 				"maxRuns":      map[string]any{"type": "integer", "description": "create/update: total scheduled-run cap for recurring tasks (0 = unlimited)"},
-				"cwd":          map[string]any{"type": "string", "description": "create/update: working directory (default: current session cwd)"},
+				"cwd":          map[string]any{"type": "string", "description": "create/update: working directory (default: current session cwd); outside the current session cwd requires the user to create the task via UI/CLI"},
 				"model":        map[string]any{"type": "string", "description": "create/update: provider/model, empty = global default"},
-				"level":        map[string]any{"type": "string", "enum": []string{"readonly", "write", "full"}, "description": "create/update: tool tier of the unattended session (default full)"},
+				"level":        map[string]any{"type": "string", "enum": []string{"readonly", "write", "full"}, "description": "create/update: tool tier of the unattended session (default readonly; full is reserved for tasks the user creates via UI/CLI)"},
 				"limit":        map[string]any{"type": "integer", "description": "history: max rows (default 10)"},
 			},
 			"required": []string{"action"},
@@ -117,6 +118,31 @@ func toolCreate(d *ToolDeps, params map[string]any) (*agent.AgentToolResult, err
 	if cwd == "" && d.Session != nil {
 		cwd = d.Session.GetCwd()
 	}
+	level := strParam(params["level"])
+	// 工具创建的缺省级别收紧为 readonly：full/越界 cwd 是保留特权（见下），
+	// readonly 覆盖绝大多数定时提醒/巡检场景且无侧信道风险
+	if level == "" {
+		level = LevelReadonly
+	}
+	// 特权收紧：无人值守任务不允许模型静默建到 full 或会话目录之外——
+	// 提示注入可借此建立常驻任意代码执行。full/越界 cwd 须用户经设置
+	// 界面或 CLI 亲自创建
+	if level == LevelFull {
+		return tools.ToolError("automation create: level=full is reserved for tasks the user creates via settings UI or CLI; omit level (defaults to readonly) or use write only after asking the user"), nil
+	}
+	if d.Session != nil {
+		sessCwd, err := filepath.Abs(d.Session.GetCwd())
+		if err != nil {
+			return tools.ToolError("automation create: resolve session cwd: " + err.Error()), nil
+		}
+		taskCwd, err := filepath.Abs(cwd)
+		if err != nil {
+			return tools.ToolError("automation create: resolve cwd: " + err.Error()), nil
+		}
+		if taskCwd != sessCwd {
+			return tools.ToolError("automation create: cwd outside the session working directory is reserved for tasks the user creates via settings UI or CLI; omit cwd to run in " + sessCwd), nil
+		}
+	}
 	sc, err := scheduleFromParams(params)
 	if err != nil {
 		return tools.ToolError("automation create: " + err.Error()), nil
@@ -127,7 +153,7 @@ func toolCreate(d *ToolDeps, params map[string]any) (*agent.AgentToolResult, err
 		Prompt:   prompt,
 		Cwd:      cwd,
 		Model:    strings.TrimSpace(strParam(params["model"])),
-		Level:    strParam(params["level"]),
+		Level:    level,
 		Schedule: *sc,
 		MaxRuns:  intParam(params["maxRuns"]),
 	}
@@ -262,6 +288,10 @@ func toolUpdate(d *ToolDeps, params map[string]any) (*agent.AgentToolResult, err
 	}
 	if v, ok := params["level"]; ok {
 		s := strParam(v)
+		// update 与 create 同门槛：full 是用户保留特权，防把既有任务静默升权
+		if s == LevelFull {
+			return tools.ToolError("automation update: level=full is reserved for tasks the user creates via settings UI or CLI"), nil
+		}
 		p.Level = &s
 	}
 	if v, ok := params["maxRuns"]; ok {

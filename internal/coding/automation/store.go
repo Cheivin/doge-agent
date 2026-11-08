@@ -460,6 +460,14 @@ func Validate(a *Automation) error {
 	if a.Cwd == "" {
 		return errors.New("cwd required")
 	}
+	// cwd 创建时即校验：绝对路径且存在为目录。相对路径/~ 展开失败要到首次
+	// 运行（可能数天后）才报错，期间任务反复失败空转
+	if !filepath.IsAbs(a.Cwd) {
+		return fmt.Errorf("cwd must be an absolute path: %s", a.Cwd)
+	}
+	if info, err := os.Stat(a.Cwd); err != nil || !info.IsDir() {
+		return fmt.Errorf("cwd not a directory: %s", a.Cwd)
+	}
 	switch a.Level {
 	case "", LevelReadonly, LevelWrite, LevelFull:
 	default:

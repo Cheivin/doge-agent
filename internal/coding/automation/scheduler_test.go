@@ -409,3 +409,48 @@ func selfPID() int { return pidSelf }
 
 // pidSelf 当前测试进程 pid
 var pidSelf = os.Getpid()
+
+// TestSettleKeepsAdvancedNextRun: 长 run 期间 maintain 已把错过周期记 skipped
+// 并推进 NextRunAt——settle 不得从原 scheduledAt 回拨（否则回拨点再次空转
+// 一轮 misfire）。短 run（未推进）仍按锚点网格推导，节奏不漂移。
+func TestSettleKeepsAdvancedNextRun(t *testing.T) {
+	env := newTestEnv(t)
+	a := mustCreate(t, env, makeAutomation(env, ScheduleInterval))
+	scheduledAt := a.NextRunAt
+
+	// 模拟长 run：maintain 已推进两轮（每轮记 skipped），NextRunAt = 原+20min
+	advanced := scheduledAt + 2*600
+	if err := env.store.Mutate(func(list []*Automation) ([]*Automation, bool, error) {
+		cur := findByID(list, a.ID)
+		cur.Running = true
+		cur.NextRunAt = advanced
+		return list, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	env.runner.settle(a, "schedule", scheduledAt, OutcomeSucceeded, nil, false)
+	got, _ := env.store.Get(a.ID)
+	if got.NextRunAt != advanced {
+		t.Fatalf("nextRunAt = %v, want advanced %v (no rewind)", time.Unix(got.NextRunAt, 0), time.Unix(advanced, 0))
+	}
+	if got.Running {
+		t.Fatal("still running after settle")
+	}
+
+	// 短 run：NextRunAt 未被推进 → 按锚点网格推导原+10min
+	a2 := mustCreate(t, env, makeAutomation(env, ScheduleInterval))
+	scheduledAt2 := a2.NextRunAt
+	if err := env.store.Mutate(func(list []*Automation) ([]*Automation, bool, error) {
+		cur := findByID(list, a2.ID)
+		cur.Running = true
+		return list, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	env.runner.settle(a2, "schedule", scheduledAt2, OutcomeSucceeded, nil, false)
+	got2, _ := env.store.Get(a2.ID)
+	if got2.NextRunAt != scheduledAt2+600 {
+		t.Fatalf("short-run nextRunAt = %v, want anchor grid %v", time.Unix(got2.NextRunAt, 0), time.Unix(scheduledAt2+600, 0))
+	}
+}

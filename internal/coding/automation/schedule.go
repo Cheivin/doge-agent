@@ -55,7 +55,9 @@ func nextInterval(sc Schedule, from time.Time) (time.Time, error) {
 		return time.Unix(sc.AnchorAt+k*step, 0), nil
 	case "hour":
 		step := time.Duration(sc.Interval) * time.Hour
-		base := anchor.Truncate(time.Hour).Add(time.Duration(atM) * time.Minute)
+		// 锚点"当日当时：atM"作第 0 候选：按本地钟表字段构造，不能用
+		// Truncate(time.Hour)（按 UTC 截断，半小时时区错位十几分钟）
+		base := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), anchor.Hour(), atM, 0, 0, anchor.Location())
 		diff := from.Sub(base)
 		k := int64(1)
 		if diff > 0 {
@@ -120,8 +122,10 @@ func nextMonth(sc Schedule, from, anchor time.Time, atH, atM int) (time.Time, er
 		base := firstOfMonth.AddDate(0, m*sc.Interval, 0)
 		for _, d := range sorted {
 			cand := time.Date(base.Year(), base.Month(), d, atH, atM, 0, 0, base.Location())
-			if cand.Month() != base.Month() {
-				continue // 2/30 溢出守卫
+			if cand.Day() != d {
+				// 短月钳到月末：1/31 锚定的月任务 2 月跑 2/28（4/30、6/30 同理），
+				// 不再静默跳过短月
+				cand = time.Date(base.Year(), base.Month()+1, 0, atH, atM, 0, 0, base.Location())
 			}
 			if cand.After(from) {
 				return cand, nil
@@ -205,8 +209,12 @@ func parseCronField(f string, min, max int) (cronField, error) {
 		}
 		lo, hi := min, max
 		switch {
-		case body == "*":
+		case body == "*" && step == 1:
+			// 纯 * 才是无限制字段；*/n 是受限字段（步进位图），不得置 star
+			//（否则 0 9 * * */2 的 dayOK 恒真，每天触发）
 			out.star = true
+		case body == "*":
+			// */n：全范围按 n 步进的受限字段，lo/hi 已是字段边界
 		case strings.Contains(body, "-"):
 			dash := strings.Index(body, "-")
 			l, err1 := strconv.Atoi(body[:dash])
@@ -243,16 +251,19 @@ func parseCronField(f string, min, max int) (cronField, error) {
 // next 从 from（不含）起找下一个匹配时刻，本地时区。逐字段进位：字段不匹配
 // 就跳到该字段的下一个允许值，低字段重置为最小允许值（重置为 0 会漏掉
 // "分钟只允许 30" 这类表达式）。每轮严格前进，迭代数远小于分钟枚举。
+// DST：日跳转一律落到次日 00:00（恒存在，无规范化漂移）；时刻候选构造后
+// 校验墙钟未漂移（time.Date 对缺口时刻会顺延，视为该日该墙钟不存在），
+// 杜绝"构造出 03:30 → hour 位图只许 2 → 每轮跳一天 → 2000 轮空转返回零值"
+// 的春令时死循环（曾把纽约 30 2 * * * 的循环任务永久停用）
 func (c *cronSpec) next(from time.Time) time.Time {
 	firstMin := lowestBit(c.minute)
-	firstHour := lowestBit(c.hour)
 	t := from.Truncate(time.Minute).Add(time.Minute)
 	for i := 0; i < 2000; i++ {
 		y, m, d := t.Date()
 		loc := t.Location()
 		if c.month&(1<<int(m)) == 0 {
-			// 跳到下一个允许月的 1 号，时分取最小允许值
-			nm := time.Date(y, m, 1, firstHour, firstMin, 0, 0, loc).AddDate(0, 1, 0)
+			// 跳到下一个允许月的 1 号 00:00，时分交给下方字段检查
+			nm := time.Date(y, m, 1, 0, 0, 0, 0, loc).AddDate(0, 1, 0)
 			for c.month&(1<<int(nm.Month())) == 0 {
 				nm = nm.AddDate(0, 1, 0)
 			}
@@ -260,27 +271,45 @@ func (c *cronSpec) next(from time.Time) time.Time {
 			continue
 		}
 		if !c.dayOK(t) {
-			// 跳到下一日历日（可能滚进下月，月检查下一轮重查）
-			t = time.Date(y, m, d, firstHour, firstMin, 0, 0, loc).AddDate(0, 0, 1)
+			// 跳到下一日历日 00:00（可能滚进下月，月检查下一轮重查）
+			t = time.Date(y, m, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
 			continue
 		}
 		if c.hour&(1<<t.Hour()) == 0 {
-			if h := nextBit(c.hour, t.Hour()); h >= 0 {
+			h := nextBit(c.hour, t.Hour())
+			for h >= 0 {
+				cand := time.Date(y, m, d, h, firstMin, 0, 0, loc)
+				if !clockDrift(cand, h, firstMin) {
+					break
+				}
+				h = nextBit(c.hour, h) // 该墙钟当日不存在（DST 缺口），试下一个
+			}
+			if h >= 0 {
 				t = time.Date(y, m, d, h, firstMin, 0, 0, loc)
 			} else {
-				t = time.Date(y, m, d, firstHour, firstMin, 0, 0, loc).AddDate(0, 0, 1)
+				t = time.Date(y, m, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
 			}
 			continue
 		}
 		if c.minute&(1<<t.Minute()) == 0 {
-			if m2 := nextBit(c.minute, t.Minute()); m2 >= 0 {
-				t = time.Date(y, m, d, t.Hour(), m2, 0, 0, loc)
+			m2 := nextBit(c.minute, t.Minute())
+			found := -1
+			for m2 >= 0 {
+				cand := time.Date(y, m, d, t.Hour(), m2, 0, 0, loc)
+				if !clockDrift(cand, t.Hour(), m2) {
+					found = m2
+					break
+				}
+				m2 = nextBit(c.minute, m2)
+			}
+			if found >= 0 {
+				t = time.Date(y, m, d, t.Hour(), found, 0, 0, loc)
 				continue
 			}
 			if h := nextBit(c.hour, t.Hour()); h >= 0 {
 				t = time.Date(y, m, d, h, firstMin, 0, 0, loc)
 			} else {
-				t = time.Date(y, m, d, firstHour, firstMin, 0, 0, loc).AddDate(0, 0, 1)
+				t = time.Date(y, m, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
 			}
 			continue
 		}
@@ -288,6 +317,12 @@ func (c *cronSpec) next(from time.Time) time.Time {
 	}
 	// 合理范围内无匹配（如 2 月 30 日）：视为无下次触发
 	return time.Time{}
+}
+
+// clockDrift 报告构造的墙钟是否被 time.Date 规范化漂移（DST 缺口时刻不
+// 存在，会顺延到其后首个有效时刻）。漂移即该日该墙钟不可触发
+func clockDrift(t time.Time, h, m int) bool {
+	return t.Hour() != h || t.Minute() != m
 }
 
 // lowestBit 位图最小允许值

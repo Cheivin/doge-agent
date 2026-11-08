@@ -37,12 +37,19 @@ type UploadSettings struct {
 
 // AutomationSettings 定时任务调度配置（settings.json "automation" 节，零值取
 // automation 包默认值）。只在全局 settings 生效——定时任务自带 cwd，不随项目拆分。
+// Enabled 用指针：nil（未写）= 启用（部分配置块如 {"runTimeoutMinutes":120}
+// 不得静默停用调度器），显式 false 才停用
 type AutomationSettings struct {
-	Enabled              bool `json:"enabled,omitempty"`
-	MaxConcurrentRuns    int  `json:"maxConcurrentRuns,omitempty"`
-	RunTimeoutMinutes    int  `json:"runTimeoutMinutes,omitempty"`
-	HistoryRetentionDays int  `json:"historyRetentionDays,omitempty"`
-	MaxAutomations       int  `json:"maxAutomations,omitempty"`
+	Enabled              *bool `json:"enabled,omitempty"`
+	MaxConcurrentRuns    int   `json:"maxConcurrentRuns,omitempty"`
+	RunTimeoutMinutes    int   `json:"runTimeoutMinutes,omitempty"`
+	HistoryRetentionDays int   `json:"historyRetentionDays,omitempty"`
+	MaxAutomations       int   `json:"maxAutomations,omitempty"`
+}
+
+// AutomationEnabled 返回调度开关：nil = 启用
+func (a *AutomationSettings) AutomationEnabled() bool {
+	return a == nil || a.Enabled == nil || *a.Enabled
 }
 
 // Settings following the settings.json (a subset): global + project merged,
@@ -109,6 +116,12 @@ func readSettingsFile(path string) (Settings, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// ReadSettingsFile 读取单个 settings 文件（缺失视为空）。供需要区分全局/
+// 项目两层的写路径使用——合并视图会掩盖字段实际所在层。
+func ReadSettingsFile(path string) (Settings, error) {
+	return readSettingsFile(path)
 }
 
 // mergeSettings deep-merges project over global (scalar fields: project wins;

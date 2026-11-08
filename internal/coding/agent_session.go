@@ -1173,6 +1173,12 @@ func (s *AgentSession) ForkRemoteTo(sess *Session, level RemoteToolLevel, model 
 	if err != nil {
 		return nil, err
 	}
+	// 无人值守会话收紧：外部目录默认拒绝（仅上传暂存区例外——远端任务
+	// 下发的文件落在这里），堵住 readonly 借 read 读 auth.json/mesh-key、
+	// write 借路径改写 permissions.json/automations.json 提权
+	if base, err := permissions.LoadPolicy(permissions.DefaultPaths(AgentDir(), cwd)...); err == nil {
+		fork.permissions.SetPolicy(permissions.UnattendedPolicy(base, UploadsDir()))
+	}
 	return fork, nil
 }
 
@@ -1201,13 +1207,14 @@ func (s *AgentSession) ResolveSession(idOrPath string) (*Session, error) {
 }
 
 // remoteToolSet builds the built-in tool set for a remote task permission
-// level, bound to ops.
+// level, bound to ops. code 不向无人值守任务挂载：它以用户全权限跑
+// node/python3，绕过权限层，write 级借它等同 full
 func remoteToolSet(ops *tools.Operations, level RemoteToolLevel) []*agent.AgentTool {
 	switch level {
 	case RemoteWrite:
 		return []*agent.AgentTool{
 			tools.ReadTool(ops), tools.GrepTool(ops), tools.FindTool(ops), tools.LSTool(ops),
-			tools.WriteTool(ops), tools.EditTool(ops), tools.CodeTool(ops),
+			tools.WriteTool(ops), tools.EditTool(ops),
 		}
 	case RemoteFull:
 		return tools.AllTools(ops)

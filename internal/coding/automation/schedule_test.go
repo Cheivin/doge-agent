@@ -115,12 +115,12 @@ func TestComputeNextRunIntervalMonth(t *testing.T) {
 	if !next.Equal(at("2026-11-16 09:00")) {
 		t.Fatalf("month next = %v, want 11-16 09:00", next)
 	}
-	// 1 月 31 日每 1 个月：2 月无 31 日，滚月跳过守卫应落到 3 月 31 日
+	// 1 月 31 日每 1 个月：2 月无 31 日，钳到月末 2/28（不再静默跳过短月）
 	anchor = at("2026-01-31 09:00")
 	sc = Schedule{Kind: ScheduleInterval, IntervalUnit: "month", Interval: 1, AnchorAt: anchor.Unix()}
 	next, _ = computeNextRun(sc, anchor)
-	if !next.Equal(at("2026-03-31 09:00")) {
-		t.Fatalf("month overflow next = %v, want 03-31 09:00", next)
+	if !next.Equal(at("2026-02-28 09:00")) {
+		t.Fatalf("month overflow next = %v, want 02-28 09:00 (clamp to month end)", next)
 	}
 	// 指定 monthDays：anchor 月内 15 号先触发，再下一档跨到 12-01（步长 2 跳过 11 月）
 	anchor = at("2026-10-01 09:00")
@@ -151,6 +151,8 @@ func TestCronNext(t *testing.T) {
 		{"0 9-11 * * *", "2026-10-16 09:30", "2026-10-16 10:00"},  // 范围
 		{"0 0 29 2 *", "2026-10-16 10:00", "2028-02-29 00:00"},    // 闰年 2 月 29
 		{"0 9 * * 7", "2026-10-16 10:00", "2026-10-18 09:00"},     // 7 = 周日
+		{"0 9 */2 * *", "2026-10-16 10:00", "2026-10-17 09:00"},   // */2 dom 是受限字段：16(偶)已过→17(奇)? 17 奇数匹配 → 10-17
+		{"0 9 * * */2", "2026-10-16 10:00", "2026-10-17 09:00"},   // */2 dow 是受限字段（周五=5 不匹配偶数 dow）→ 10-17 周六=6 匹配
 	}
 	for _, c := range cases {
 		spec, err := parseCron(c.expr)
@@ -161,6 +163,82 @@ func TestCronNext(t *testing.T) {
 		if !got.Equal(at(c.want)) {
 			t.Errorf("cron %q from %s = %v, want %s", c.expr, c.from, got, c.want)
 		}
+	}
+	// */2 在 dom 上必须是受限字段（旧 bug：视同 *，每天都触发）。
+	// */2 从 1 起步 = 奇数日：10-17(奇)已过 → 下一个奇数日 10-19
+	spec, err := parseCron("0 9 */2 * *")
+	if err != nil {
+		t.Fatalf("parseCron: %v", err)
+	}
+	got := spec.next(at("2026-10-17 10:00"))
+	if !got.Equal(at("2026-10-19 09:00")) {
+		t.Fatalf("dom */2 from 10-17 = %v, want 10-19 09:00 (奇数日)", got)
+	}
+}
+
+// TestCronDSTSpringForward: 春令时缺口（纽约 2026-03-08 02:00→03:00）里的
+// 30 2 * * * 必须给出下一次触发（当日跳到缺口后的下一匹配或次日），绝不能
+// 返回零值把循环任务永久停用
+func TestCronDSTSpringForward(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skip("tzdata unavailable")
+	}
+	spec, err := parseCron("30 2 * * *")
+	if err != nil {
+		t.Fatalf("parseCron: %v", err)
+	}
+	// from = 缺口当日 01:59（02:30 缺口不存在）：应返回次日 02:30
+	from := time.Date(2026, 3, 8, 1, 59, 0, 0, loc)
+	got := spec.next(from)
+	if got.IsZero() {
+		t.Fatal("spring-forward gap returned zero time; recurring task would be permanently disabled")
+	}
+	want := time.Date(2026, 3, 9, 2, 30, 0, 0, loc)
+	if !got.Equal(want) {
+		t.Fatalf("spring-forward next = %v, want %v (next day 02:30)", got, want)
+	}
+	// 缺口前一日：应返回缺口日 02:30 —— 该墙钟不存在，顺延到当日首个有效
+	// 时刻（03:30 EDT）或次日 02:30 均可接受，但绝不能是零值或早于 from
+	from2 := time.Date(2026, 3, 7, 3, 0, 0, 0, loc)
+	got2 := spec.next(from2)
+	if got2.IsZero() || !got2.After(from2) {
+		t.Fatalf("pre-gap next = %v, want a valid instant after %v", got2, from2)
+	}
+}
+
+// TestCronDSTFallBack: 秋令时重复时刻（纽约 2026-11-01 01:00-02:00 出现两次）
+// 不得返回早于 from 的时刻
+func TestCronDSTFallBack(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skip("tzdata unavailable")
+	}
+	spec, err := parseCron("30 1 * * *")
+	if err != nil {
+		t.Fatalf("parseCron: %v", err)
+	}
+	// from = fall-back 后的 01:45 EST（第二次 01 点区间）
+	from := time.Date(2026, 11, 1, 1, 45, 0, 0, loc)
+	got := spec.next(from)
+	if got.IsZero() || !got.After(from) {
+		t.Fatalf("fall-back next = %v, want a valid instant after %v", got, from)
+	}
+}
+
+// TestIntervalHourHalfHourZone: 小时级步长在半小时时区（+05:30）不得因
+// UTC 截断错位——锚点 10:20 建"每 1 小时"，下一次应是 11:20 而非 10:50
+func TestIntervalHourHalfHourZone(t *testing.T) {
+	loc := time.FixedZone("+0530", 5*3600+30*60)
+	anchor := time.Date(2026, 10, 16, 10, 20, 0, 0, loc)
+	sc := Schedule{Kind: ScheduleInterval, IntervalUnit: "hour", Interval: 1, AnchorAt: anchor.Unix()}
+	next, err := computeNextRun(sc, anchor)
+	if err != nil {
+		t.Fatalf("computeNextRun: %v", err)
+	}
+	want := time.Date(2026, 10, 16, 11, 20, 0, 0, loc)
+	if !next.Equal(want) {
+		t.Fatalf("hourly next = %v, want %v (same :20 minute, not :50)", next, want)
 	}
 }
 
