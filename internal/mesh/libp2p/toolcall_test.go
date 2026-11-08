@@ -51,11 +51,30 @@ func execRemoteTool(t *testing.T, bridge *Bridge, a *meshNode, peerRef, tool str
 
 // TestRemoteToolDirectForward: the master adds a forward rule ON the slave via
 // remote_tool — no remote agent session involved; the rule must exist on the
-// slave afterwards.
+// slave afterwards. 写操作要求从侧显式开 allowRemoteForwards（fail-closed），
+// 只读 list 在 allowRemoteTools 下即可用。
 func TestRemoteToolDirectForward(t *testing.T) {
 	bridge, a, b := newToolPair(t, true, true)
 
+	// 默认（allowRemoteForwards 关）：写操作被拒，规则不落盘
 	out := execRemoteTool(t, bridge, a, b.host.ID().String(), "mesh_forward", map[string]any{
+		"action": "add", "name": "svc", "mode": "expose", "local": "127.0.0.1:8080",
+	})
+	if !strings.Contains(out, "denied") || !strings.Contains(out, "allowRemoteForwards") {
+		t.Fatalf("output = %q, want an allowRemoteForwards rejection", out)
+	}
+	if len(b.ForwardList()) != 0 {
+		t.Fatalf("slave state changed without allowRemoteForwards: %v", b.ForwardList())
+	}
+
+	// 只读 list 仍可用
+	if out := execRemoteTool(t, bridge, a, b.host.ID().String(), "mesh_forward", map[string]any{"action": "list"}); strings.Contains(out, "denied") {
+		t.Fatalf("read-only list must stay allowed under allowRemoteTools: %q", out)
+	}
+
+	// 显式开 allowRemoteForwards：写操作放行
+	b.cfg.AllowRemoteForwards = true
+	out = execRemoteTool(t, bridge, a, b.host.ID().String(), "mesh_forward", map[string]any{
 		"action": "add", "name": "svc", "mode": "expose", "local": "127.0.0.1:8080",
 	})
 	if !strings.Contains(out, "svc") {

@@ -31,6 +31,12 @@ var directToolAllowlist = map[string]bool{
 	"remote_agent_status": true,
 }
 
+// forwardReadActions 是 mesh_forward 的只读操作：allowRemoteTools 开启即可
+// 直接调用；写操作（改节点转发配置）额外要求 allowRemoteForwards
+var forwardReadActions = map[string]bool{
+	"list": true,
+}
+
 // peerTrusted reports whether from may act on this node: the corresponding
 // allow switch must be on, and when a trustedPeers whitelist is configured the
 // sender must be on it. Shared by remote tasks and direct tool calls.
@@ -94,6 +100,14 @@ func (h *remoteToolHandler) handle(env mesh.Envelope) {
 	}
 	if !directToolAllowlist[cp.Tool] {
 		h.replyError(env.From, env.ID, "denied", "tool "+cp.Tool+" is not allowed for direct remote execution")
+		return
+	}
+	// mesh_forward 的写操作会改本节点转发配置（暴露服务/绑定监听/改规则），
+	// 比只读检查危险得多：直接调用路径没有任务级别，单独用 allowRemoteForwards
+	// 门控（默认关）。远端 agent 任务内使用 mesh_forward 仍由 remoteTaskLevel
+	// full 才挂载，不受此开关影响
+	if cp.Tool == "mesh_forward" && !forwardReadActions[strParam(cp.Args["action"])] && !h.m.cfg.AllowRemoteForwards {
+		h.replyError(env.From, env.ID, "denied", "mesh_forward write actions require allowRemoteForwards on this node")
 		return
 	}
 	tool := h.findTool(cp.Tool)

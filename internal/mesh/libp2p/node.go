@@ -416,9 +416,13 @@ func (m *meshNode) handleAgentStream(s network.Stream) {
 			}
 			return
 		}
-		if env.From == "" {
-			env.From = from
+		// 发送方身份一律取流身份：payload 自报 From 仅在与流身份一致时接受，
+		// 不一致即伪造（可冒充 trustedPeer 过鉴权），丢帧并记日志
+		if env.From != "" && env.From != from {
+			meshLogf("drop %s frame from %s: spoofed sender %q", env.Type, from, env.From)
+			continue
 		}
+		env.From = from
 		m.dispatch(env)
 	}
 }

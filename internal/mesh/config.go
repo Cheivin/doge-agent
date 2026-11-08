@@ -16,11 +16,16 @@ type Config struct {
 	AllowRemoteTasks bool     `json:"allowRemoteTasks"`
 	RemoteTaskLevel  string   `json:"remoteTaskLevel,omitempty"`
 	// AllowRemoteTools 允许 peer 用 remote_tool 直接调用本节点级工具
-	// （mesh_forward/mesh_peers/remote_agent_status，不经远端 agent）。
-	// 默认开（token 即准入边界，同 token 节点本就受信）；关闭须显式写 false。
-	// 注意：缺省=true 只在 LoadConfig 生效，内存构造的 Config 零值仍是 false
-	AllowRemoteTools   bool     `json:"allowRemoteTools"`
-	TrustedPeers       []string `json:"trustedPeers,omitempty"`
+	// （mesh_peers/remote_agent_status 与 mesh_forward 只读操作，不经远端
+	// agent）。默认关（fail-closed）：token 只是准入边界，直接调用能触碰
+	// 节点配置，须显式开启。序列化不带 omitempty：mesh new 显式写出该字段，
+	// 开关可见
+	AllowRemoteTools bool `json:"allowRemoteTools"`
+	// AllowRemoteForwards 允许 peer 经 remote_tool 直接调用 mesh_forward 的
+	// 写操作（add/remove/enable/disable/reload——可暴露本机服务、绑定监听、
+	// 改动转发规则）。默认关；AllowRemoteTools 只放开只读操作
+	AllowRemoteForwards bool     `json:"allowRemoteForwards"`
+	TrustedPeers        []string `json:"trustedPeers,omitempty"`
 	MaxConcurrentTasks int      `json:"maxConcurrentTasks,omitempty"`
 	BootstrapPeers     []string `json:"bootstrapPeers,omitempty"`
 	PrivateNetwork     bool     `json:"privateNetwork"`
@@ -49,12 +54,12 @@ func DefaultConfigPath() string {
 }
 
 // LoadConfig 读取指定路径的配置；文件不存在时返回默认配置（不报错），
-// 让首次 `doge mesh new` 从默认值起步。allowRemoteTools 缺省视为 true
-// （老配置兼容），要关闭须显式写 false
+// 让首次 `doge mesh new` 从默认值起步。allowRemoteTools/allowRemoteForwards
+// 缺省视为 false（fail-closed）：直接调用能触碰节点配置，须显式开启
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return &Config{AllowRemoteTools: true}, nil
+		return &Config{}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -63,16 +68,11 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, err
 	}
-	var raw map[string]json.RawMessage
-	if json.Unmarshal(data, &raw) == nil {
-		if _, ok := raw["allowRemoteTools"]; !ok {
-			c.AllowRemoteTools = true
-		}
-	}
 	return &c, nil
 }
 
-// SaveConfig 写配置（0600，与 agent 目录其它凭据文件一致）
+// SaveConfig 写配置（0600，与 agent 目录其它凭据文件一致）；临时文件 +
+// rename 原子落盘，避免并发写或崩溃留下半截 JSON
 func SaveConfig(path string, c *Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -81,7 +81,11 @@ func SaveConfig(path string, c *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // TokenObj 解码嵌入的 token
