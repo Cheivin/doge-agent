@@ -3164,6 +3164,11 @@ function renderSettingsModels(custom) {
     settingsModelProvider = providers[0] || "";
   }
 
+  const wrap = document.createElement("div");
+  wrap.className = "model-split";
+  const nav = document.createElement("div");
+  nav.className = "model-providers";
+
   // 顶部默认模型选择（独立整行，位于双列布局之上）：settings 管下次启动，
   // /api/model 管当前会话（双写）
   const defBar = document.createElement("div");
